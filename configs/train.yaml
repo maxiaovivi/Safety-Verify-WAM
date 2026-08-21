@@ -1,0 +1,55 @@
+seed: 7
+device: cuda
+output_dir: checkpoints/safety_verify_wam
+resume_from: null
+
+dataset:
+  root: /path/to/safety_dataset
+  train_manifest: manifests/train.jsonl
+  image_size: [384, 320]
+  image_size_policy: error
+  action_shape: [16, 14]
+  require_normalized_actions: true
+  normalized_action_limit: 1.05
+  num_workers: 4
+
+backbone:
+  kind: efficient_wam
+  source_root: third_party/Efficient-WAM
+  base_checkpoint: /path/to/efficient_wam_stage3.pt
+  wan_root: /path/to/Wan2.2-TI2V-5B
+  vae_path: /path/to/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  precision: bfloat16
+  num_video_frames: 8
+  rollout_steps: 4
+  flow_shift: 5.0
+  rollout_seed: 17
+  randomize_training_noise: true
+  train_mode: head_only
+  train_last_joint_layers: 2
+
+model:
+  hidden_dim: 512
+  num_heads: 8
+  num_layers: 2
+  dropout: 0.1
+  max_future_steps: 8
+  max_action_steps: 16
+  num_risk_types: 0
+  unsafe_threshold: 0.5
+
+loss:
+  chunk_weight: 1.0
+  step_weight: 0.0
+  type_weight: 0.0
+  positive_weight: null
+
+training:
+  epochs: 20
+  batch_size: 2
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-3
+  max_grad_norm: 1.0
+  amp: bfloat16
+  log_every_steps: 10
+  save_every_epochs: 1

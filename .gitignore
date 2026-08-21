@@ -1,0 +1,48 @@
+# External Efficient-WAM checkout
+third_party/Efficient-WAM/
+
+# Model assets and checkpoints
+checkpoint/
+checkpoints/
+artifacts/
+outputs/
+runs/
+wandb/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.bin
+*.safetensors.index.json
+*.bin.index.json
+
+# Local datasets and private path overrides
+data/
+datasets/
+configs/local.yaml
+configs/*_local.yaml
+.env
+
+# Generated media and arrays
+*.mp4
+*.avi
+*.npy
+*.npz
+
+# Python/build/editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+.idea/
+.vscode/
