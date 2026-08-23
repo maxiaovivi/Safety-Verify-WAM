@@ -244,6 +244,28 @@ def stage1_distillation_loss(
     }
 
 
+class _OVCREditorTrainableView(nn.Module):
+    """Expose only OVCR conditioning modules to AHA's DiT-only trainer."""
+
+    def __init__(self, student: OVCRSActionGenerator) -> None:
+        super().__init__()
+        # Keep this as a non-registered reference. The student remains the one
+        # owner of checkpoint keys while this view controls optimizer selection.
+        object.__setattr__(self, "_student", student)
+
+    def parameters(self, recurse: bool = True):  # type: ignore[override]
+        student = object.__getattribute__(self, "_student")
+        yield from student.query_encoder.parameters(recurse=recurse)
+        yield from student.cache_editor.parameters(recurse=recurse)
+
+    def train(self, mode: bool = True) -> "_OVCREditorTrainableView":
+        self.training = mode
+        student = object.__getattribute__(self, "_student")
+        student.query_encoder.train(mode)
+        student.cache_editor.train(mode)
+        return self
+
+
 class AHAOVCRSStage1Program(nn.Module):
     """AHA-compatible Stage 1 training model.
 
@@ -263,11 +285,21 @@ class AHAOVCRSStage1Program(nn.Module):
         self.student = student
         self.loss_config = loss_config
         self.efficient_training_adapter = efficient_training_adapter
+        self._freeze_action_expert = bool(
+            getattr(efficient_training_adapter, "freeze_action_expert", False)
+        )
+        object.__setattr__(
+            self,
+            "_editor_trainable_view",
+            _OVCREditorTrainableView(student),
+        )
         if teacher_adapter.student_config != student.config:
             raise ValueError("Teacher adapter and student use different OVCR-S configs")
 
     @property
-    def dit(self) -> OVCRSActionGenerator:
+    def dit(self) -> nn.Module:
+        if self._freeze_action_expert:
+            return object.__getattribute__(self, "_editor_trainable_view")
         return self.student
 
     @property
@@ -363,6 +395,20 @@ class AHAOVCRSStage1Program(nn.Module):
             ),
             "step": step,
         }
+        if self.efficient_training_adapter is not None:
+            payload["efficient_training"] = {
+                "action_noise_sampling": getattr(
+                    self.efficient_training_adapter,
+                    "action_noise_sampling",
+                    None,
+                ),
+                "action_flow_target": getattr(
+                    self.efficient_training_adapter,
+                    "action_flow_target",
+                    None,
+                ),
+                "freeze_action_expert": self._freeze_action_expert,
+            }
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, checkpoint_path)

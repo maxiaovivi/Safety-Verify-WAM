@@ -6,13 +6,64 @@ import torch
 
 from safety_verify_wam.stage1.aha_teacher import AHAOVCRSTeacherBatch
 from safety_verify_wam.stage1.distill import (
+    AHAOVCRSStage1Program,
     Stage1LossConfig,
     _resolve_parameter_dtype,
     stage1_distillation_loss,
 )
+from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class Stage1DistillationLossTest(unittest.TestCase):
+    def test_editor_only_view_survives_aha_trainer_freeze_sequence(self) -> None:
+        config = OVCRSConfig(
+            observation_dim=2,
+            query_dim=4,
+            num_queries=2,
+            video_dim=4,
+            num_heads=1,
+            head_dim=4,
+            num_layers=1,
+            editor_rank=2,
+            state_dim=2,
+            action_dim=2,
+            action_hidden_dim=4,
+            action_ffn_dim=8,
+            action_chunk_size=2,
+            num_registers=1,
+            time_embedding_dim=4,
+            distill_layers=(1,),
+        )
+        student = OVCRSActionGenerator(config)
+        teacher_adapter = torch.nn.Module()
+        teacher_adapter.student_config = config
+        efficient_adapter = torch.nn.Module()
+        efficient_adapter.freeze_action_expert = True
+        program = AHAOVCRSStage1Program(
+            teacher_adapter,
+            student,
+            Stage1LossConfig(),
+            efficient_training_adapter=efficient_adapter,
+        )
+
+        program.eval()
+        program.requires_grad_(False)
+        program.dit.train()
+        program.dit.requires_grad_(True)
+
+        self.assertTrue(
+            all(parameter.requires_grad for parameter in student.query_encoder.parameters())
+        )
+        self.assertTrue(
+            all(parameter.requires_grad for parameter in student.cache_editor.parameters())
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in student.action_expert.parameters()
+            )
+        )
+
     def test_student_parameter_dtype_supports_fp32_master_weights(self) -> None:
         self.assertIs(
             _resolve_parameter_dtype("float32", fallback=torch.bfloat16),

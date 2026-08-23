@@ -54,6 +54,8 @@ class EfficientStudentTrainingAdapter(nn.Module):
         action_sigma_shift: float = 5.0,
         video_sigma_shift: float = 5.0,
         action_noise_sampling: str = "aha_anchors",
+        action_flow_target: str = "aha_teacher",
+        freeze_action_expert: bool = False,
     ) -> None:
         super().__init__()
         student_config = student.config
@@ -67,6 +69,12 @@ class EfficientStudentTrainingAdapter(nn.Module):
             raise ValueError(
                 "action_noise_sampling must be 'aha_anchors' or 'uniform_shifted'"
             )
+        self.action_flow_target = str(action_flow_target).strip().lower()
+        if self.action_flow_target not in {"aha_teacher", "ground_truth"}:
+            raise ValueError(
+                "action_flow_target must be 'aha_teacher' or 'ground_truth'"
+            )
+        self.freeze_action_expert = bool(freeze_action_expert)
         if self.num_video_steps <= 0:
             raise ValueError("num_video_steps must be positive")
         if self.num_video_frames <= 0 or self.num_video_frames % 4:
@@ -130,6 +138,9 @@ class EfficientStudentTrainingAdapter(nn.Module):
         for parameter in self.efficient_model.parameters():
             parameter.requires_grad_(False)
         share_efficient_action_expert(self.efficient_model, student)
+        if self.freeze_action_expert:
+            for parameter in student.action_expert.parameters():
+                parameter.requires_grad_(False)
 
         flow_scheduler = scheduler_module.FlowMatchScheduler
         self.video_scheduler = flow_scheduler(
@@ -205,6 +216,19 @@ class EfficientStudentTrainingAdapter(nn.Module):
             timestep_id
         ]
         return sigma, action_t
+
+    def _select_action_flow_target(
+        self,
+        teacher_action: torch.Tensor,
+        ground_truth_action: torch.Tensor,
+    ) -> torch.Tensor:
+        if teacher_action.shape != ground_truth_action.shape:
+            raise ValueError(
+                "Teacher and ground-truth actions must have identical shapes"
+            )
+        if self.action_flow_target == "aha_teacher":
+            return teacher_action
+        return ground_truth_action
 
     def _initialize_video_latent(
         self, current_frame: torch.Tensor
@@ -368,17 +392,21 @@ class EfficientStudentTrainingAdapter(nn.Module):
             device=target_device, dtype=target_dtype
         )
         initial_state = initial_state.to(device=target_device, dtype=target_dtype)
+        flow_action = self._select_action_flow_target(
+            teacher_action,
+            ground_truth_action,
+        )
         sigma, action_t = self._sample_action_noise_level(
             targets.sigma,
             device=target_device,
             dtype=target_dtype,
         )
-        noise = torch.randn_like(teacher_action)
+        noise = torch.randn_like(flow_action)
         noisy_action = (
-            teacher_action * (1 - sigma[:, None, None])
+            flow_action * (1 - sigma[:, None, None])
             + noise * sigma[:, None, None]
         )
-        target_velocity = noise - teacher_action
+        target_velocity = noise - flow_action
         sample_action = sample.get("action")
         video = sample.get("video")
         context = sample.get("context")

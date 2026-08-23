@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1.0e-5)
+    parser.add_argument("--weight-decay", type=float, default=1.0e-2)
     parser.add_argument(
         "--student-parameter-dtype",
         choices=("bfloat16", "float32"),
@@ -33,6 +34,16 @@ def parse_args() -> argparse.Namespace:
         choices=("aha_anchors", "uniform_shifted"),
         default="aha_anchors",
     )
+    parser.add_argument(
+        "--action-flow-target",
+        choices=("aha_teacher", "ground_truth"),
+        default="aha_teacher",
+    )
+    parser.add_argument("--freeze-action-expert", action="store_true")
+    parser.add_argument("--velocity-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-action-weight", type=float, default=1.0)
+    parser.add_argument("--ground-truth-action-weight", type=float, default=0.25)
+    parser.add_argument("--preservation-weight", type=float, default=0.25)
     return parser.parse_args()
 
 
@@ -50,6 +61,7 @@ def main() -> None:
             "batch_size": int(args.batch_size),
             "num_workers": int(args.num_workers),
             "learning_rate": float(args.learning_rate),
+            "weight_decay": float(args.weight_decay),
             "max_steps": int(args.max_steps),
             "log_every": 1,
             "save_every": max(1, int(args.max_steps)),
@@ -69,10 +81,10 @@ def main() -> None:
     student["state_dim"] = 14
     model["student_parameter_dtype"] = args.student_parameter_dtype
     model["loss_config"] = {
-        "velocity_weight": 1.0,
-        "teacher_action_weight": 1.0,
-        "ground_truth_action_weight": 0.25,
-        "preservation_weight": 0.25,
+        "velocity_weight": float(args.velocity_weight),
+        "teacher_action_weight": float(args.teacher_action_weight),
+        "ground_truth_action_weight": float(args.ground_truth_action_weight),
+        "preservation_weight": float(args.preservation_weight),
         "query_weight": 0.0,
         "route_weight": 0.0,
         "delta_weight": 0.0,
@@ -93,6 +105,8 @@ def main() -> None:
         "action_sigma_shift": 5.0,
         "video_sigma_shift": 5.0,
         "action_noise_sampling": args.action_noise_sampling,
+        "action_flow_target": args.action_flow_target,
+        "freeze_action_expert": bool(args.freeze_action_expert),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

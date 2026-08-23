@@ -24,6 +24,40 @@ from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_action_flow_target_rejects_unknown_value(self) -> None:
+        fake_student = type("FakeStudent", (), {"config": OVCRSConfig()})()
+        with self.assertRaisesRegex(ValueError, "action_flow_target"):
+            EfficientStudentTrainingAdapter(
+                student=fake_student,
+                deploy_config_path="unused",
+                aha_dataset_stats_path="unused",
+                efficient_dataset_stats_path="unused",
+                action_flow_target="unknown",
+            )
+
+    def test_action_flow_target_selects_requested_clean_action(self) -> None:
+        adapter = EfficientStudentTrainingAdapter.__new__(
+            EfficientStudentTrainingAdapter
+        )
+        torch.nn.Module.__init__(adapter)
+        teacher_action = torch.full((2, 3, 4), 1.0)
+        ground_truth_action = torch.full((2, 3, 4), 2.0)
+
+        adapter.action_flow_target = "aha_teacher"
+        self.assertIs(
+            adapter._select_action_flow_target(
+                teacher_action, ground_truth_action
+            ),
+            teacher_action,
+        )
+        adapter.action_flow_target = "ground_truth"
+        self.assertIs(
+            adapter._select_action_flow_target(
+                teacher_action, ground_truth_action
+            ),
+            ground_truth_action,
+        )
+
     def test_uniform_shifted_noise_samples_full_scheduler_table(self) -> None:
         adapter = EfficientStudentTrainingAdapter.__new__(
             EfficientStudentTrainingAdapter
