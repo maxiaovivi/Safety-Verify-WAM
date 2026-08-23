@@ -1,0 +1,52 @@
+# Copy this template outside Git and replace every /path/to value before running.
+policy_name: ovcrs_policy
+task_name: adjust_bottle
+task_config: demo_clean
+ckpt_setting: /path/to/Efficient-WAM_stage3.pt
+ovcrs_checkpoint: /path/to/best_fixed_panel.pt
+aha_dataset_stats_path: /path/to/aha_dataset_stats.json
+wan_path: /path/to/Wan2.2-TI2V-5B-runtime
+device: cuda
+seed: 42
+instruction_type: unseen
+eval_num_episodes: 1
+skip_get_obs_within_replan: false
+
+common:
+  num_video_frames: 8
+  video_height: 384
+  video_width: 320
+
+action_normalization:
+  enabled: true
+  type: mean_std
+  stats_path: /path/to/Efficient-WAM_action_stats.json
+
+inference:
+  num_inference_steps: 10
+  video_refresh_steps: [0, 1]
+  video_stop_cosine_threshold: null
+  action_skip_cosine_threshold: null
+  save_predicted_video: false
+  torch_compile:
+    enabled: false
+
+model:
+  compact_wan:
+    precision: bfloat16
+    dim: 2048
+    ffn_dim: 8192
+    num_heads: 16
+    num_layers: 12
+    head_dim: 128
+    future_video_size: [192, 160]
+  action_expert:
+    dim: 768
+    ffn_dim: 3072
+    num_layers: 12
+    chunk_size: 16
+    state_dim: 14
+    action_dim: 14
+
+ovcrs_precision: bf16
+observation_downsample_factor: 1

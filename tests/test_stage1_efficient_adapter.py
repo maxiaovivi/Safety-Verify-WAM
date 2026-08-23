@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+
+from safety_verify_wam.stage1.efficient_adapter import (
+    AHAActionDenormalizer,
+    compact_first_frame_video_cache,
+    load_ovcrs_student,
+    observation_tokens_from_condition_latent,
+)
+from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
+
+
+class EfficientAdapterTest(unittest.TestCase):
+    def test_observation_tokens_preserve_spatial_order(self) -> None:
+        latent = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 2, 2)
+        tokens = observation_tokens_from_condition_latent(latent)
+        self.assertEqual(tuple(tokens.shape), (1, 4, 2))
+        torch.testing.assert_close(tokens[0, 0], torch.tensor([0.0, 4.0]))
+        torch.testing.assert_close(tokens[0, 3], torch.tensor([3.0, 7.0]))
+
+    def test_multiscale_cache_keeps_only_condition_tokens(self) -> None:
+        keys = [torch.arange(48, dtype=torch.float32).reshape(1, 6, 2, 4) for _ in range(2)]
+        values = [tensor + 100.0 for tensor in keys]
+        compact = compact_first_frame_video_cache(
+            {
+                "grid_sizes": {"condition_seq_len": 3, "future_seq_len": 3},
+                "video_k": keys,
+                "video_v": values,
+            },
+            expected_layers=2,
+            expected_dim=8,
+        )
+        self.assertEqual(len(compact), 2)
+        self.assertEqual(tuple(compact[0]["k"].shape), (1, 3, 8))
+        torch.testing.assert_close(compact[0]["v"], compact[0]["k"] + 100.0)
+
+    def test_single_scale_cache_derives_first_frame_size(self) -> None:
+        keys = [torch.zeros(1, 12, 1, 4)]
+        compact = compact_first_frame_video_cache(
+            {
+                "grid_sizes": torch.tensor([[3, 2, 2]]),
+                "video_k": keys,
+                "video_v": keys,
+            },
+            expected_layers=1,
+            expected_dim=4,
+        )
+        self.assertEqual(tuple(compact[0]["k"].shape), (1, 4, 4))
+
+    def test_aha_action_denormalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stats.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "action": {
+                            "default": {
+                                "global_mean": [1.0, -2.0],
+                                "global_std": [0.5, 4.0],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            normalizer = AHAActionDenormalizer.from_dataset_stats(path)
+        action = normalizer.denormalize(torch.tensor([[[2.0, 0.5]]]))
+        torch.testing.assert_close(action, torch.tensor([[[2.0, 0.0]]]))
+
+    def test_stage1_checkpoint_loads_strictly(self) -> None:
+        config = OVCRSConfig(
+            observation_dim=2,
+            query_dim=4,
+            num_queries=2,
+            video_dim=4,
+            num_heads=1,
+            head_dim=4,
+            num_layers=1,
+            editor_rank=2,
+            action_dim=2,
+            action_hidden_dim=4,
+            action_ffn_dim=8,
+            action_chunk_size=2,
+            num_registers=1,
+            time_embedding_dim=4,
+            distill_layers=(1,),
+        )
+        original = OVCRSActionGenerator(config)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "student.pt"
+            torch.save(
+                {
+                    "format": "ovcr_s_stage1",
+                    "student": original.state_dict(),
+                    "student_config": config.to_dict(),
+                    "step": 12,
+                },
+                path,
+            )
+            restored, payload = load_ovcrs_student(
+                path,
+                device="cpu",
+                dtype=torch.float32,
+            )
+        self.assertEqual(payload["step"], 12)
+        for expected, actual in zip(original.parameters(), restored.parameters()):
+            torch.testing.assert_close(expected, actual)
+
+
+if __name__ == "__main__":
+    unittest.main()
