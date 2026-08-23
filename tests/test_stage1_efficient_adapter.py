@@ -15,10 +15,19 @@ from safety_verify_wam.stage1.efficient_adapter import (
     load_ovcrs_student,
     observation_tokens_from_condition_latent,
 )
+from safety_verify_wam.stage1.efficient_training import _shared_batch_timestep
 from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_video_scheduler_receives_one_shared_batch_timestep(self) -> None:
+        timestep = torch.tensor([750.0, 750.0, 750.0, 750.0])
+        shared = _shared_batch_timestep(timestep)
+        self.assertEqual(shared.ndim, 0)
+        self.assertEqual(float(shared.item()), 750.0)
+        with self.assertRaisesRegex(ValueError, "shared batch timestep"):
+            _shared_batch_timestep(torch.tensor([750.0, 250.0]))
+
     def test_observation_tokens_preserve_spatial_order(self) -> None:
         latent = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 2, 2)
         tokens = observation_tokens_from_condition_latent(latent)

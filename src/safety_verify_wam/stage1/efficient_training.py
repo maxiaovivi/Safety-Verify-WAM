@@ -18,6 +18,18 @@ from .efficient_adapter import (
 from .ovcr_s import OVCRSConfig
 
 
+def _shared_batch_timestep(timestep: torch.Tensor) -> torch.Tensor:
+    """Return the scalar timestep used by a scheduler for a shared batch step."""
+
+    if timestep.numel() == 0:
+        raise ValueError("A video timestep batch cannot be empty")
+    flattened = timestep.reshape(-1)
+    first = flattened[0]
+    if not torch.equal(flattened, first.expand_as(flattened)):
+        raise ValueError("Efficient video denoising requires one shared batch timestep")
+    return first
+
+
 class EfficientStudentTrainingAdapter(nn.Module):
     """Build deployment-matched Efficient K/V and Efficient-space flow targets.
 
@@ -263,7 +275,7 @@ class EfficientStudentTrainingAdapter(nn.Module):
             if video_step + 1 < self.num_video_steps:
                 video_latent = self.video_scheduler.step(
                     outputs["video_pred"],
-                    current_video_t,
+                    _shared_batch_timestep(current_video_t),
                     video_latent,
                 )
                 if not self.efficient_model.compact_wan.is_multiscale:
