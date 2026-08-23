@@ -77,6 +77,7 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 - 固定训练和验证样本清单；
 - 固定 seed 42；
+- 单卡 AdamW 使用 FP32 学生主权重和优化器状态，前向仍使用 BF16 autocast；
 - 在更新参数前完成一次验证，记为 `step_000000`；
 - 训练 100～300 optimizer steps；
 - 每 10 steps 记录所有分项损失和梯度范数；

@@ -154,6 +154,9 @@ def main() -> int:
     }
     report["model_and_dataset_init_seconds"] = time.perf_counter() - initialized
     report["trainable_parameters"] = sum(parameter.numel() for parameter in parameters)
+    report["student_parameter_dtypes"] = sorted(
+        {str(parameter.dtype) for parameter in parameters}
+    )
     report["status"] = "running"
     atomic_json(output_path, report)
 
@@ -176,12 +179,21 @@ def main() -> int:
             optimizer.step()
             torch.cuda.synchronize(0)
             total_seconds = time.perf_counter() - started
+            optimizer_state_dtypes = sorted(
+                {
+                    str(value.dtype)
+                    for state in optimizer.state.values()
+                    for value in state.values()
+                    if isinstance(value, torch.Tensor) and value.is_floating_point()
+                }
+            )
             row = {
                 "step": step,
                 "loss": float(loss.detach().float().item()),
                 "metrics": {key: float(value) for key, value in metrics.items()},
                 "grad_norm_before_clip": float(grad_norm.detach().float().item()),
                 "gradients": gradients,
+                "optimizer_state_dtypes": optimizer_state_dtypes,
                 "forward_seconds": forward_seconds,
                 "backward_seconds": backward_seconds,
                 "optimizer_seconds": total_seconds - forward_seconds - backward_seconds,

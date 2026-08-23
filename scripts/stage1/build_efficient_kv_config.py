@@ -21,6 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1.0e-5)
+    parser.add_argument(
+        "--student-parameter-dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-video-steps", type=int, default=2)
     return parser.parse_args()
@@ -57,6 +62,7 @@ def main() -> None:
     model = payload["model"]
     student = model.setdefault("student_config", {})
     student["state_dim"] = 14
+    model["student_parameter_dtype"] = args.student_parameter_dtype
     model["loss_config"] = {
         "velocity_weight": 1.0,
         "teacher_action_weight": 1.0,

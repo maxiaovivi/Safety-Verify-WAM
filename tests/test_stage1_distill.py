@@ -5,10 +5,26 @@ import unittest
 import torch
 
 from safety_verify_wam.stage1.aha_teacher import AHAOVCRSTeacherBatch
-from safety_verify_wam.stage1.distill import Stage1LossConfig, stage1_distillation_loss
+from safety_verify_wam.stage1.distill import (
+    Stage1LossConfig,
+    _resolve_parameter_dtype,
+    stage1_distillation_loss,
+)
 
 
 class Stage1DistillationLossTest(unittest.TestCase):
+    def test_student_parameter_dtype_supports_fp32_master_weights(self) -> None:
+        self.assertIs(
+            _resolve_parameter_dtype("float32", fallback=torch.bfloat16),
+            torch.float32,
+        )
+        self.assertIs(
+            _resolve_parameter_dtype(None, fallback=torch.bfloat16),
+            torch.bfloat16,
+        )
+        with self.assertRaisesRegex(ValueError, "student_parameter_dtype"):
+            _resolve_parameter_dtype("float16", fallback=torch.bfloat16)
+
     def test_efficient_conditioning_skips_aha_structural_targets(self) -> None:
         prediction = torch.zeros(1, 2, 2)
         teacher_action = torch.ones_like(prediction)

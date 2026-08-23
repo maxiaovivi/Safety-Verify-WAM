@@ -12,6 +12,29 @@ from .aha_teacher import AHAOVCRSTeacherBatch, AHAOVCRTeacherAdapter
 from .ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
+def _resolve_parameter_dtype(
+    value: str | torch.dtype | None,
+    *,
+    fallback: torch.dtype,
+) -> torch.dtype:
+    if value is None:
+        return fallback
+    if isinstance(value, torch.dtype):
+        return value
+    aliases = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    key = str(value).strip().lower()
+    if key not in aliases:
+        raise ValueError(
+            "student_parameter_dtype must be one of: bf16, bfloat16, fp32, float32"
+        )
+    return aliases[key]
+
+
 @dataclass(frozen=True)
 class Stage1LossConfig:
     velocity_weight: float = 1.0
@@ -396,6 +419,7 @@ def create_aha_ovcr_s_stage1(
     efficient_action_checkpoint: str | Path | None = None,
     strict_action_init: bool = True,
     efficient_conditioning: Mapping[str, Any] | None = None,
+    student_parameter_dtype: str | torch.dtype | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cuda",
 ) -> AHAOVCRSStage1Program:
@@ -428,7 +452,11 @@ def create_aha_ovcr_s_stage1(
         student.load_efficient_action_expert(
             checkpoint, strict=bool(strict_action_init)
         )
-    student.to(device=torch.device(device), dtype=model_dtype)
+    resolved_parameter_dtype = _resolve_parameter_dtype(
+        student_parameter_dtype,
+        fallback=model_dtype,
+    )
+    student.to(device=torch.device(device), dtype=resolved_parameter_dtype)
     efficient_training_adapter: nn.Module | None = None
     if efficient_conditioning is not None:
         structural_weights = {
