@@ -14,8 +14,9 @@ from .efficient_adapter import (
     AHAEfficientNormalizerBridge,
     compact_video_cache,
     observation_tokens_from_condition_latent,
+    share_efficient_action_expert,
 )
-from .ovcr_s import OVCRSConfig
+from .ovcr_s import OVCRSActionGenerator
 
 
 def _shared_batch_timestep(timestep: torch.Tensor) -> torch.Tensor:
@@ -41,7 +42,7 @@ class EfficientStudentTrainingAdapter(nn.Module):
     def __init__(
         self,
         *,
-        student_config: OVCRSConfig,
+        student: OVCRSActionGenerator,
         deploy_config_path: str | Path,
         aha_dataset_stats_path: str | Path,
         efficient_dataset_stats_path: str | Path,
@@ -54,6 +55,7 @@ class EfficientStudentTrainingAdapter(nn.Module):
         video_sigma_shift: float = 5.0,
     ) -> None:
         super().__init__()
+        student_config = student.config
         self.student_config = student_config
         self.device_name = str(device)
         self.student_dtype = student_dtype
@@ -121,6 +123,7 @@ class EfficientStudentTrainingAdapter(nn.Module):
         self.efficient_model.eval()
         for parameter in self.efficient_model.parameters():
             parameter.requires_grad_(False)
+        share_efficient_action_expert(self.efficient_model, student)
 
         flow_scheduler = scheduler_module.FlowMatchScheduler
         self.video_scheduler = flow_scheduler(
@@ -223,7 +226,10 @@ class EfficientStudentTrainingAdapter(nn.Module):
         tuple[dict[str, torch.Tensor], ...],
         torch.Tensor,
     ]:
-        self.efficient_model.eval()
+        # ``student.train()`` also changes the shared action expert's mode.
+        # Keep the frozen video branch in evaluation mode without resetting
+        # that shared module immediately before the student forward pass.
+        self.efficient_model.compact_wan.eval()
         video_latent, condition_latent = self._initialize_video_latent(current_frame)
         batch_size = int(current_frame.shape[0])
         if text_context.ndim != 3 or text_context.shape[0] != batch_size:

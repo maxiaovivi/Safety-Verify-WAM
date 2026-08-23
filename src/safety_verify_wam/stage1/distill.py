@@ -476,7 +476,7 @@ def create_aha_ovcr_s_stage1(
         from .efficient_training import EfficientStudentTrainingAdapter
 
         efficient_training_adapter = EfficientStudentTrainingAdapter(
-            student_config=resolved_student_config,
+            student=student,
             device=device,
             student_dtype=model_dtype,
             **dict(efficient_conditioning),

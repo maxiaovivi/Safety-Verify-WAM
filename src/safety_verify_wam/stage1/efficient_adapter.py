@@ -326,6 +326,51 @@ def prepare_ovcrs_conditioning(
     )
 
 
+def share_efficient_action_expert(
+    efficient_model: torch.nn.Module,
+    student: OVCRSActionGenerator,
+) -> torch.nn.Module:
+    """Bind Efficient-WAM and OVCR-S to one action-expert module.
+
+    The OVCR-S action branch intentionally mirrors Efficient-WAM's parameter
+    layout.  Validate that contract before replacing the runtime module so a
+    deployment cannot silently keep two incompatible action experts.
+    """
+
+    original = getattr(efficient_model, "action_expert", None)
+    if not isinstance(original, torch.nn.Module):
+        raise TypeError("Efficient-WAM model has no action_expert module")
+    replacement = student.action_expert
+
+    original_state = original.state_dict()
+    replacement_state = replacement.state_dict()
+    missing = sorted(set(original_state) - set(replacement_state))
+    unexpected = sorted(set(replacement_state) - set(original_state))
+    mismatched = sorted(
+        key
+        for key in set(original_state).intersection(replacement_state)
+        if tuple(original_state[key].shape) != tuple(replacement_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        raise RuntimeError(
+            "Efficient-WAM and OVCR-S action experts are incompatible: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}, "
+            f"mismatched={mismatched[:10]}"
+        )
+
+    original_freq_dim = int(
+        getattr(original, "freq_dim", student.config.time_embedding_dim)
+    )
+    if original_freq_dim != int(student.config.time_embedding_dim):
+        raise RuntimeError(
+            "Efficient-WAM and OVCR-S timestep embedding dims differ: "
+            f"{original_freq_dim} vs {student.config.time_embedding_dim}"
+        )
+    replacement.freq_dim = original_freq_dim
+    efficient_model.action_expert = replacement
+    return replacement
+
+
 def load_ovcrs_student(
     checkpoint_path: str | Path,
     *,

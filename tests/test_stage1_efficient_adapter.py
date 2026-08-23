@@ -14,12 +14,90 @@ from safety_verify_wam.stage1.efficient_adapter import (
     compact_video_cache,
     load_ovcrs_student,
     observation_tokens_from_condition_latent,
+    share_efficient_action_expert,
 )
 from safety_verify_wam.stage1.efficient_training import _shared_batch_timestep
 from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_efficient_runtime_and_student_share_one_action_expert(self) -> None:
+        config = OVCRSConfig(
+            observation_dim=2,
+            query_dim=4,
+            num_queries=2,
+            video_dim=4,
+            num_heads=1,
+            head_dim=4,
+            num_layers=1,
+            editor_rank=2,
+            state_dim=2,
+            action_dim=2,
+            action_hidden_dim=4,
+            action_ffn_dim=8,
+            action_chunk_size=2,
+            num_registers=1,
+            time_embedding_dim=4,
+            distill_layers=(1,),
+        )
+        student = OVCRSActionGenerator(config)
+        runtime_model = torch.nn.Module()
+        runtime_model.action_expert = OVCRSActionGenerator(config).action_expert
+        runtime_model.action_expert.freq_dim = config.time_embedding_dim
+
+        shared = share_efficient_action_expert(runtime_model, student)
+
+        self.assertIs(shared, student.action_expert)
+        self.assertIs(runtime_model.action_expert, student.action_expert)
+        self.assertEqual(runtime_model.action_expert.freq_dim, config.time_embedding_dim)
+
+    def test_action_expert_sharing_rejects_incompatible_shapes(self) -> None:
+        student = OVCRSActionGenerator(
+            OVCRSConfig(
+                observation_dim=2,
+                query_dim=4,
+                num_queries=2,
+                video_dim=4,
+                num_heads=1,
+                head_dim=4,
+                num_layers=1,
+                editor_rank=2,
+                state_dim=2,
+                action_dim=2,
+                action_hidden_dim=4,
+                action_ffn_dim=8,
+                action_chunk_size=2,
+                num_registers=1,
+                time_embedding_dim=4,
+                distill_layers=(1,),
+            )
+        )
+        incompatible = OVCRSActionGenerator(
+            OVCRSConfig(
+                observation_dim=2,
+                query_dim=4,
+                num_queries=2,
+                video_dim=4,
+                num_heads=1,
+                head_dim=4,
+                num_layers=1,
+                editor_rank=2,
+                state_dim=2,
+                action_dim=3,
+                action_hidden_dim=4,
+                action_ffn_dim=8,
+                action_chunk_size=2,
+                num_registers=1,
+                time_embedding_dim=4,
+                distill_layers=(1,),
+            )
+        )
+        runtime_model = torch.nn.Module()
+        runtime_model.action_expert = incompatible.action_expert
+
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            share_efficient_action_expert(runtime_model, student)
+
     def test_video_scheduler_receives_one_shared_batch_timestep(self) -> None:
         timestep = torch.tensor([750.0, 750.0, 750.0, 750.0])
         shared = _shared_batch_timestep(timestep)

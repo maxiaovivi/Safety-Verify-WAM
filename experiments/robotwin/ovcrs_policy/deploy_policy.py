@@ -14,6 +14,7 @@ from EfficientWAM.runner import EfficientWAMRunner, _new_forward_timer
 from safety_verify_wam.stage1.efficient_adapter import (
     load_ovcrs_student,
     prepare_ovcrs_conditioning,
+    share_efficient_action_expert,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,7 @@ def get_model(usr_args: Dict[str, Any]) -> OVCRSEfficientWAMRunner:
         device=device,
         dtype=_dtype_from_name(str(usr_args.get("ovcrs_precision", "bf16"))),
     )
+    share_efficient_action_expert(runtime.model, student)
     runner = OVCRSEfficientWAMRunner(
         runtime=runtime,
         student=student,
