@@ -21,6 +21,8 @@ class AHAOVCRSTeacherBatch:
     teacher_velocity: torch.Tensor
     teacher_action: torch.Tensor
     ground_truth_action: torch.Tensor
+    initial_state: torch.Tensor
+    reference_velocity: torch.Tensor | None
     observation_tokens: torch.Tensor
     observation_mask: torch.Tensor
     video_kv_cache: tuple[dict[str, torch.Tensor], ...]
@@ -121,6 +123,7 @@ class AHAOVCRTeacherAdapter(nn.Module):
         rollout_steps: int = 16,
         capture_steps: Sequence[int] = (0, 1, 2, 4, 8, 12, 16),
         sigma_shift: float | None = None,
+        capture_structural_targets: bool = True,
     ) -> None:
         super().__init__()
         self.teacher = teacher
@@ -129,6 +132,7 @@ class AHAOVCRTeacherAdapter(nn.Module):
         self.rollout_steps = int(rollout_steps)
         self.capture_steps = tuple(sorted({int(step) for step in capture_steps}))
         self.sigma_shift = sigma_shift
+        self.capture_structural_targets = bool(capture_structural_targets)
         if len(self.teacher_layer_mapping) != student_config.num_layers:
             raise ValueError(
                 "teacher_layer_mapping must contain one teacher layer per student layer"
@@ -372,6 +376,142 @@ class AHAOVCRTeacherAdapter(nn.Module):
         return indices
 
     @torch.no_grad()
+    def _prepare_action_only_batch(
+        self,
+        sample: dict[str, Any],
+        *,
+        tiled: bool,
+    ) -> AHAOVCRSTeacherBatch:
+        """Keep only AHA final actions; Efficient supplies all student inputs."""
+
+        rollout = self._rollout(sample, tiled)
+        video_state = rollout["video_state"]
+        ground_truth_action = video_state["action"].detach()
+        teacher_action_full = rollout["final_latents"].detach()
+        batch_size, action_horizon, action_dim = ground_truth_action.shape
+        chunk_size = self.student_config.action_chunk_size
+        if action_dim != self.student_config.action_dim:
+            raise ValueError(
+                f"AHA action dim {action_dim} differs from OVCR-S "
+                f"{self.student_config.action_dim}"
+            )
+        if action_horizon % chunk_size:
+            raise ValueError("AHA action horizon is not divisible by the student chunk size")
+        num_chunks = action_horizon // chunk_size
+        chunk_index = self._choose_chunk_indices(
+            sample,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            device=ground_truth_action.device,
+        )
+        teacher_action = _gather_action_chunk(
+            teacher_action_full, chunk_index, chunk_size
+        )
+        ground_truth_chunk = _gather_action_chunk(
+            ground_truth_action, chunk_index, chunk_size
+        )
+
+        available_anchor_steps = tuple(
+            int(step)
+            for step in rollout["capture_step_indices"]
+            if int(step) < self.rollout_steps
+        )
+        if not available_anchor_steps:
+            raise RuntimeError("AHA rollout returned no usable action-noise anchor")
+        anchor_choice = torch.randint(
+            len(available_anchor_steps),
+            (batch_size,),
+            device=ground_truth_action.device,
+        )
+        anchor_values = torch.tensor(
+            available_anchor_steps,
+            device=ground_truth_action.device,
+            dtype=torch.long,
+        )[anchor_choice]
+        timesteps = rollout["timesteps"].to(
+            device=ground_truth_action.device, dtype=ground_truth_action.dtype
+        )
+        action_t = timesteps[anchor_values]
+        scheduler = self.raw_model.infer_action_scheduler
+        train_timesteps = float(
+            getattr(
+                scheduler,
+                "num_train_timesteps",
+                self.student_config.num_train_timesteps,
+            )
+        )
+        sigma = (action_t.float() / train_timesteps).clamp(0.0, 1.0)
+
+        proprio = sample.get("proprio")
+        if not isinstance(proprio, torch.Tensor) or proprio.ndim != 3:
+            raise ValueError(
+                "sample['proprio'] must be [B,T,D] for Efficient action conditioning"
+            )
+        if (
+            proprio.shape[0] != batch_size
+            or proprio.shape[-1] != self.student_config.state_dim
+        ):
+            raise ValueError(
+                "sample proprio shape differs from the Efficient student state shape: "
+                f"{tuple(proprio.shape)}"
+            )
+        state_indices = (chunk_index * chunk_size).clamp_max(proprio.shape[1] - 1)
+        initial_state = torch.gather(
+            proprio.to(device=ground_truth_action.device),
+            dim=1,
+            index=state_indices.view(batch_size, 1, 1).expand(
+                -1, 1, self.student_config.state_dim
+            ),
+        )[:, 0]
+
+        action_is_pad = sample.get("action_is_pad")
+        if isinstance(action_is_pad, torch.Tensor) and tuple(action_is_pad.shape[:2]) == (
+            batch_size,
+            action_horizon,
+        ):
+            action_is_pad = _gather_action_chunk(
+                action_is_pad.to(device=ground_truth_action.device, dtype=torch.bool),
+                chunk_index,
+                chunk_size,
+            )
+        else:
+            action_is_pad = None
+
+        placeholder_observation = torch.zeros(
+            (batch_size, 1, 1, self.student_config.observation_dim),
+            device=ground_truth_action.device,
+            dtype=ground_truth_action.dtype,
+        )
+        placeholder_queries = torch.zeros(
+            (batch_size, 1, self.student_config.num_queries, self.student_config.query_dim),
+            device=ground_truth_action.device,
+            dtype=ground_truth_action.dtype,
+        )
+        return AHAOVCRSTeacherBatch(
+            noisy_action=teacher_action,
+            action_t=action_t,
+            sigma=sigma,
+            teacher_velocity=torch.zeros_like(teacher_action),
+            teacher_action=teacher_action,
+            ground_truth_action=ground_truth_chunk,
+            initial_state=initial_state,
+            reference_velocity=None,
+            observation_tokens=placeholder_observation,
+            observation_mask=torch.ones(
+                placeholder_observation.shape[:-1],
+                device=ground_truth_action.device,
+                dtype=torch.bool,
+            ),
+            video_kv_cache=tuple(),
+            teacher_queries=placeholder_queries,
+            teacher_editor_trace={},
+            teacher_action_responses={},
+            action_is_pad=action_is_pad,
+            chunk_index=chunk_index,
+            anchor_step=anchor_values,
+        )
+
+    @torch.no_grad()
     def _predict_velocity_with_response_trace(
         self,
         *,
@@ -447,6 +587,8 @@ class AHAOVCRTeacherAdapter(nn.Module):
         tiled: bool = False,
     ) -> AHAOVCRSTeacherBatch:
         self.teacher.eval()
+        if not self.capture_structural_targets:
+            return self._prepare_action_only_batch(sample, tiled=tiled)
         rollout, captured = self._rollout_with_ovcr_trace(sample, tiled)
         video_state = rollout["video_state"]
         ground_truth_action = video_state["action"].detach()
@@ -613,6 +755,22 @@ class AHAOVCRTeacherAdapter(nn.Module):
             )
         else:
             action_is_pad = None
+        proprio = sample.get("proprio")
+        if not isinstance(proprio, torch.Tensor) or proprio.ndim != 3:
+            raise ValueError("sample['proprio'] must be [B,T,D] for Efficient action conditioning")
+        if proprio.shape[0] != batch_size or proprio.shape[-1] != self.student_config.state_dim:
+            raise ValueError(
+                "sample proprio shape differs from the Efficient student state shape: "
+                f"{tuple(proprio.shape)}"
+            )
+        state_indices = (chunk_index * chunk_size).clamp_max(proprio.shape[1] - 1)
+        initial_state = torch.gather(
+            proprio.to(device=ground_truth_action.device),
+            dim=1,
+            index=state_indices.view(batch_size, 1, 1).expand(
+                -1, 1, self.student_config.state_dim
+            ),
+        )[:, 0]
         scheduler = self.raw_model.infer_action_scheduler
         train_timesteps = float(
             getattr(scheduler, "num_train_timesteps", self.student_config.num_train_timesteps)
@@ -626,6 +784,8 @@ class AHAOVCRTeacherAdapter(nn.Module):
             teacher_velocity=teacher_velocity,
             teacher_action=teacher_action,
             ground_truth_action=ground_truth_chunk,
+            initial_state=initial_state,
+            reference_velocity=None,
             observation_tokens=observation_tokens,
             observation_mask=observation_mask,
             video_kv_cache=video_kv_cache,

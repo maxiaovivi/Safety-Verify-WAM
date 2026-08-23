@@ -12,7 +12,6 @@ from EfficientWAM.preprocess import preprocess_robotwin_observation
 from EfficientWAM.runner import EfficientWAMRunner, _new_forward_timer
 
 from safety_verify_wam.stage1.efficient_adapter import (
-    AHAActionDenormalizer,
     load_ovcrs_student,
     prepare_ovcrs_conditioning,
 )
@@ -31,6 +30,17 @@ def _dtype_from_name(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported OVCR-S precision: {name}")
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value: {value!r}")
+
+
 class OVCRSEfficientWAMRunner(EfficientWAMRunner):
     """Use Efficient-WAM video K/V and the distilled OVCR-S action generator."""
 
@@ -39,12 +49,12 @@ class OVCRSEfficientWAMRunner(EfficientWAMRunner):
         *,
         runtime: Any,
         student: torch.nn.Module,
-        action_denormalizer: AHAActionDenormalizer,
         observation_downsample_factor: int = 1,
+        condition_only_video_cache: bool = False,
     ) -> None:
         self.ovcrs_student = student
-        self.ovcrs_action_denormalizer = action_denormalizer
         self.observation_downsample_factor = int(observation_downsample_factor)
+        self.condition_only_video_cache = bool(condition_only_video_cache)
         super().__init__(runtime=runtime)
         if self.observation_downsample_factor <= 0:
             raise ValueError("observation_downsample_factor must be positive")
@@ -148,6 +158,7 @@ class OVCRSEfficientWAMRunner(EfficientWAMRunner):
                         condition_latent=condition_latent,
                         video_cache=video_cache,
                         observation_downsample_factor=self.observation_downsample_factor,
+                        condition_only=self.condition_only_video_cache,
                     )
 
                     current_video_pred = self._video_velocity_for_similarity(
@@ -184,6 +195,10 @@ class OVCRSEfficientWAMRunner(EfficientWAMRunner):
                 action_pred = self.ovcrs_student.predict_velocity(
                     noisy_actions,
                     current_action_t,
+                    normalized_state.to(
+                        device=student_parameter.device,
+                        dtype=student_parameter.dtype,
+                    ),
                     student_conditioning,
                     return_trace=False,
                 )["action_velocity"]
@@ -210,7 +225,7 @@ class OVCRSEfficientWAMRunner(EfficientWAMRunner):
             profile_ms_sums,
             profile_calls,
         ) = self._finish_forward_timer(vgm_forward_timer)
-        actions = self.ovcrs_action_denormalizer.denormalize(noisy_actions)
+        actions = self.runtime.action_normalizer.denormalize(noisy_actions)
         predicted_video_has_condition_frame = not self.model.compact_wan.is_multiscale
         return (
             actions,
@@ -242,21 +257,19 @@ def get_model(usr_args: Dict[str, Any]) -> OVCRSEfficientWAMRunner:
     checkpoint_path = usr_args.get("ovcrs_checkpoint")
     if not checkpoint_path:
         raise ValueError("ovcrs_checkpoint is required")
-    stats_path = usr_args.get("aha_dataset_stats_path")
-    if not stats_path:
-        raise ValueError("aha_dataset_stats_path is required")
     student, payload = load_ovcrs_student(
         checkpoint_path,
         device=device,
         dtype=_dtype_from_name(str(usr_args.get("ovcrs_precision", "bf16"))),
     )
-    denormalizer = AHAActionDenormalizer.from_dataset_stats(stats_path)
     runner = OVCRSEfficientWAMRunner(
         runtime=runtime,
         student=student,
-        action_denormalizer=denormalizer,
         observation_downsample_factor=int(
             usr_args.get("observation_downsample_factor", 1)
+        ),
+        condition_only_video_cache=_as_bool(
+            usr_args.get("condition_only_video_cache", False)
         ),
     )
     logger.info(

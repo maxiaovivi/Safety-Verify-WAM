@@ -17,6 +17,7 @@ class Stage1LossConfig:
     velocity_weight: float = 1.0
     teacher_action_weight: float = 1.0
     ground_truth_action_weight: float = 0.25
+    preservation_weight: float = 0.0
     query_weight: float = 0.05
     route_weight: float = 0.10
     delta_weight: float = 0.10
@@ -28,6 +29,7 @@ class Stage1LossConfig:
             self.velocity_weight,
             self.teacher_action_weight,
             self.ground_truth_action_weight,
+            self.preservation_weight,
             self.query_weight,
             self.route_weight,
             self.delta_weight,
@@ -102,6 +104,7 @@ def stage1_distillation_loss(
     config: Stage1LossConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     prediction = outputs["action_velocity"]
+    zero = prediction.sum() * 0.0
     velocity_loss = _masked_action_mse(
         prediction, targets.teacher_velocity, targets.action_is_pad
     )
@@ -114,11 +117,25 @@ def stage1_distillation_loss(
         denoised_action, targets.ground_truth_action, targets.action_is_pad
     )
 
-    student_queries = outputs["queries"]
-    teacher_queries = _resize_last_dimension(
-        targets.teacher_queries, student_queries.shape[-1]
-    )
-    query_loss = _cosine_loss(student_queries, teacher_queries)
+    if config.preservation_weight > 0:
+        if targets.reference_velocity is None:
+            raise ValueError(
+                "preservation_weight is enabled but no Efficient reference velocity was provided"
+            )
+        preservation_loss = _masked_action_mse(
+            prediction, targets.reference_velocity, targets.action_is_pad
+        )
+    else:
+        preservation_loss = zero
+
+    if config.query_weight > 0:
+        student_queries = outputs["queries"]
+        teacher_queries = _resize_last_dimension(
+            targets.teacher_queries, student_queries.shape[-1]
+        )
+        query_loss = _cosine_loss(student_queries, teacher_queries)
+    else:
+        query_loss = zero
 
     editor_trace = outputs.get("editor_trace", {})
     route_losses: list[torch.Tensor] = []
@@ -166,7 +183,6 @@ def stage1_distillation_loss(
                         ),
                     ]
                 )
-    zero = prediction.sum() * 0.0
     route_loss = torch.stack(route_losses).mean() if route_losses else zero
     delta_loss = torch.stack(delta_losses).mean() if delta_losses else zero
     response_losses: list[torch.Tensor] = []
@@ -186,6 +202,7 @@ def stage1_distillation_loss(
         config.velocity_weight * velocity_loss
         + config.teacher_action_weight * teacher_action_loss
         + config.ground_truth_action_weight * ground_truth_action_loss
+        + config.preservation_weight * preservation_loss
         + config.query_weight * query_loss
         + config.route_weight * route_loss
         + config.delta_weight * delta_loss
@@ -196,6 +213,7 @@ def stage1_distillation_loss(
         "loss_velocity": velocity_loss.detach(),
         "loss_teacher_action": teacher_action_loss.detach(),
         "loss_ground_truth_action": ground_truth_action_loss.detach(),
+        "loss_preservation": preservation_loss.detach(),
         "loss_query": query_loss.detach(),
         "loss_route": route_loss.detach(),
         "loss_delta": delta_loss.detach(),
@@ -215,11 +233,13 @@ class AHAOVCRSStage1Program(nn.Module):
         teacher_adapter: AHAOVCRTeacherAdapter,
         student: OVCRSActionGenerator,
         loss_config: Stage1LossConfig,
+        efficient_training_adapter: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.teacher_adapter = teacher_adapter
         self.student = student
         self.loss_config = loss_config
+        self.efficient_training_adapter = efficient_training_adapter
         if teacher_adapter.student_config != student.config:
             raise ValueError("Teacher adapter and student use different OVCR-S configs")
 
@@ -238,6 +258,8 @@ class AHAOVCRSStage1Program(nn.Module):
     def train(self, mode: bool = True) -> "AHAOVCRSStage1Program":
         super().train(mode)
         self.teacher_adapter.eval()
+        if self.efficient_training_adapter is not None:
+            self.efficient_training_adapter.eval()
         self.student.train(mode)
         return self
 
@@ -250,6 +272,11 @@ class AHAOVCRSStage1Program(nn.Module):
         tiled: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         targets = self.teacher_adapter.prepare_batch(sample, tiled=tiled)
+        if self.efficient_training_adapter is not None:
+            prepare_batch = getattr(self.efficient_training_adapter, "prepare_batch", None)
+            if not callable(prepare_batch):
+                raise TypeError("Efficient training adapter has no prepare_batch method")
+            targets = prepare_batch(sample, targets)
         needs_editor_trace = (
             self.loss_config.route_weight > 0
             or self.loss_config.delta_weight > 0
@@ -258,6 +285,7 @@ class AHAOVCRSStage1Program(nn.Module):
         outputs = self.student(
             noisy_action=targets.noisy_action,
             action_t=targets.action_t,
+            initial_state=targets.initial_state,
             observation_tokens=targets.observation_tokens,
             observation_mask=targets.observation_mask,
             video_kv_cache=targets.video_kv_cache,
@@ -367,6 +395,7 @@ def create_aha_ovcr_s_stage1(
     num_history_frames: int | None = None,
     efficient_action_checkpoint: str | Path | None = None,
     strict_action_init: bool = True,
+    efficient_conditioning: Mapping[str, Any] | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cuda",
 ) -> AHAOVCRSStage1Program:
@@ -400,6 +429,35 @@ def create_aha_ovcr_s_stage1(
             checkpoint, strict=bool(strict_action_init)
         )
     student.to(device=torch.device(device), dtype=model_dtype)
+    efficient_training_adapter: nn.Module | None = None
+    if efficient_conditioning is not None:
+        structural_weights = {
+            "query_weight": resolved_loss_config.query_weight,
+            "route_weight": resolved_loss_config.route_weight,
+            "delta_weight": resolved_loss_config.delta_weight,
+            "response_weight": resolved_loss_config.response_weight,
+        }
+        enabled_structural = {
+            name: weight for name, weight in structural_weights.items() if weight > 0
+        }
+        if enabled_structural:
+            raise ValueError(
+                "AHA structural losses cannot supervise Efficient-generated K/V; "
+                f"set these weights to zero: {enabled_structural}"
+            )
+        from .efficient_training import EfficientStudentTrainingAdapter
+
+        efficient_training_adapter = EfficientStudentTrainingAdapter(
+            student_config=resolved_student_config,
+            device=device,
+            student_dtype=model_dtype,
+            **dict(efficient_conditioning),
+        )
+    elif resolved_loss_config.preservation_weight > 0:
+        raise ValueError(
+            "preservation_weight requires efficient_conditioning"
+        )
+
     adapter = AHAOVCRTeacherAdapter(
         teacher,
         resolved_student_config,
@@ -407,6 +465,7 @@ def create_aha_ovcr_s_stage1(
         rollout_steps=rollout_steps,
         capture_steps=capture_steps,
         sigma_shift=sigma_shift,
+        capture_structural_targets=efficient_training_adapter is None,
     )
     teacher_model = adapter.raw_model
     compatibility_values = {
@@ -444,4 +503,9 @@ def create_aha_ovcr_s_stage1(
                 "Stage 1 num_history_frames differs from the AHA teacher: "
                 f"{num_history_frames} vs {actual_history}"
             )
-    return AHAOVCRSStage1Program(adapter, student, resolved_loss_config)
+    return AHAOVCRSStage1Program(
+        adapter,
+        student,
+        resolved_loss_config,
+        efficient_training_adapter=efficient_training_adapter,
+    )

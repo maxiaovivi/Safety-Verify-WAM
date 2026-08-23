@@ -9,7 +9,9 @@ import torch
 
 from safety_verify_wam.stage1.efficient_adapter import (
     AHAActionDenormalizer,
+    AHAEfficientNormalizerBridge,
     compact_first_frame_video_cache,
+    compact_video_cache,
     load_ovcrs_student,
     observation_tokens_from_condition_latent,
 )
@@ -53,6 +55,19 @@ class EfficientAdapterTest(unittest.TestCase):
         )
         self.assertEqual(tuple(compact[0]["k"].shape), (1, 4, 4))
 
+    def test_full_cache_preserves_condition_and_future_tokens(self) -> None:
+        keys = [torch.arange(48, dtype=torch.float32).reshape(1, 6, 2, 4)]
+        compact = compact_video_cache(
+            {
+                "grid_sizes": {"condition_seq_len": 3, "future_seq_len": 3},
+                "video_k": keys,
+                "video_v": keys,
+            },
+            expected_layers=1,
+            expected_dim=8,
+        )
+        self.assertEqual(tuple(compact[0]["k"].shape), (1, 6, 8))
+
     def test_aha_action_denormalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "stats.json"
@@ -73,6 +88,57 @@ class EfficientAdapterTest(unittest.TestCase):
         action = normalizer.denormalize(torch.tensor([[[2.0, 0.5]]]))
         torch.testing.assert_close(action, torch.tensor([[[2.0, 0.0]]]))
 
+    def test_aha_to_efficient_normalization_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            aha_path = root / "aha.json"
+            efficient_path = root / "efficient.json"
+            aha_path.write_text(
+                json.dumps(
+                    {
+                        "action": {
+                            "default": {
+                                "global_mean": [1.0, -2.0],
+                                "global_std": [0.5, 4.0],
+                            }
+                        },
+                        "state": {
+                            "default": {
+                                "global_mean": [3.0, 1.0],
+                                "global_std": [2.0, 0.25],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            efficient_path.write_text(
+                json.dumps(
+                    {
+                        "robotwin_qpos": {
+                            "mean": [2.0, 0.0],
+                            "std": [2.0, 2.0],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bridge = AHAEfficientNormalizerBridge.from_dataset_stats(
+                aha_path, efficient_path
+            )
+        action = torch.tensor([[[2.0, 0.5]]])
+        efficient_action = bridge.action_aha_to_efficient(action)
+        torch.testing.assert_close(
+            efficient_action, torch.tensor([[[0.0, 0.0]]])
+        )
+        torch.testing.assert_close(
+            bridge.action_efficient_to_aha(efficient_action), action
+        )
+        state = torch.tensor([[0.5, 4.0]])
+        torch.testing.assert_close(
+            bridge.state_aha_to_efficient(state), torch.tensor([[1.0, 1.0]])
+        )
+
     def test_stage1_checkpoint_loads_strictly(self) -> None:
         config = OVCRSConfig(
             observation_dim=2,
@@ -83,6 +149,7 @@ class EfficientAdapterTest(unittest.TestCase):
             head_dim=4,
             num_layers=1,
             editor_rank=2,
+            state_dim=2,
             action_dim=2,
             action_hidden_dim=4,
             action_ffn_dim=8,

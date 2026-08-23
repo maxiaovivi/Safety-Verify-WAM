@@ -7,6 +7,7 @@ student:
   head_dim: 128
   num_layers: 12
   editor_rank: 256
+  state_dim: 14
   action_dim: 14
   action_hidden_dim: 768
   action_ffn_dim: 3072
@@ -28,8 +29,9 @@ loss:
   velocity_weight: 1.0
   teacher_action_weight: 1.0
   ground_truth_action_weight: 0.25
-  query_weight: 0.05
-  route_weight: 0.10
-  delta_weight: 0.10
-  response_weight: 0.25
+  preservation_weight: 0.25
+  query_weight: 0.0
+  route_weight: 0.0
+  delta_weight: 0.0
+  response_weight: 0.0
   eps: 1.0e-6

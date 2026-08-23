@@ -21,6 +21,7 @@ class OVCRSConfig:
     head_dim: int = 128
     num_layers: int = 12
     editor_rank: int = 256
+    state_dim: int = 14
     action_dim: int = 14
     action_hidden_dim: int = 768
     action_ffn_dim: int = 3072
@@ -43,6 +44,7 @@ class OVCRSConfig:
             self.num_heads,
             self.head_dim,
             self.num_layers,
+            self.state_dim,
             self.action_dim,
             self.num_train_timesteps,
         )
@@ -102,8 +104,17 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 
 def _fixed_position_embedding(length: int, dim: int) -> torch.Tensor:
-    positions = torch.arange(length, dtype=torch.float32)
-    return sinusoidal_embedding_1d(dim, positions).unsqueeze(0)
+    if dim % 2:
+        raise ValueError("Position embedding dimension must be even")
+    half = dim // 2
+    positions = torch.arange(length, dtype=torch.float64)
+    frequencies = torch.pow(
+        torch.tensor(10000.0, dtype=torch.float64),
+        -torch.arange(half, dtype=torch.float64) / half,
+    )
+    sinusoid = torch.outer(positions, frequencies)
+    # Efficient-WAM's StateActionEncoder uses [sin, cos] for fixed positions.
+    return torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)], dim=-1).float().unsqueeze(0)
 
 
 def _three_layer_mlp(input_dim: int, output_dim: int) -> nn.Sequential:
@@ -328,29 +339,57 @@ class SharedLowRankKVEditor(nn.Module):
         return updated_cache, traces
 
 
-class ActionOnlyInputEncoder(nn.Module):
+class StateActionInputEncoder(nn.Module):
     def __init__(self, config: OVCRSConfig) -> None:
         super().__init__()
         self.config = config
+        self.state_encoder = _three_layer_mlp(config.state_dim, config.action_hidden_dim)
         self.action_encoder = _three_layer_mlp(config.action_dim, config.action_hidden_dim)
         max_length = 1 + config.action_chunk_size + config.num_registers
         self.register_buffer(
             "pos_embedding",
             _fixed_position_embedding(max_length, config.action_hidden_dim),
-            persistent=False,
         )
 
     def forward(
         self,
+        state: torch.Tensor,
         action: torch.Tensor,
         registers: torch.Tensor | None,
     ) -> torch.Tensor:
+        if action.ndim != 3 or action.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                "action must be [B,T,action_dim], "
+                f"got {tuple(action.shape)}"
+            )
+        if action.shape[1] > self.config.action_chunk_size:
+            raise ValueError(
+                f"action length exceeds {self.config.action_chunk_size}: {action.shape[1]}"
+            )
+        if state.ndim == 2:
+            state = state.unsqueeze(1)
+        if state.ndim != 3 or state.shape[1] != 1:
+            raise ValueError(
+                "state must be [B,D] or [B,1,D], "
+                f"got {tuple(state.shape)}"
+            )
+        if state.shape[0] != action.shape[0] or state.shape[-1] != self.config.state_dim:
+            raise ValueError(
+                "state must match the action batch and configured state_dim, "
+                f"got state={tuple(state.shape)}, action={tuple(action.shape)}"
+            )
+        encoded_state = self.state_encoder(state)
         encoded = self.action_encoder(action)
         action_length = int(action.shape[1])
         action_positions = self.pos_embedding[:, 1 : 1 + action_length].to(
             device=encoded.device, dtype=encoded.dtype
         )
-        encoded = encoded + action_positions
+        state_positions = self.pos_embedding[:, :1].to(
+            device=encoded_state.device, dtype=encoded_state.dtype
+        )
+        encoded = torch.cat(
+            [encoded_state + state_positions, encoded + action_positions], dim=1
+        )
         if registers is None:
             return encoded
         register_start = 1 + action_length
@@ -486,7 +525,7 @@ class CompactActionExpert(nn.Module):
     def __init__(self, config: OVCRSConfig) -> None:
         super().__init__()
         self.config = config
-        self.input_encoder = ActionOnlyInputEncoder(config)
+        self.input_encoder = StateActionInputEncoder(config)
         self.time_embedding = nn.Sequential(
             nn.Linear(config.time_embedding_dim, config.action_hidden_dim),
             nn.SiLU(),
@@ -550,8 +589,12 @@ class OVCRSActionGenerator(nn.Module):
             if full_length == action_length:
                 expanded = action_t
             else:
-                register_time = action_t[:, -1:].expand(-1, full_length - action_length)
-                expanded = torch.cat([action_t, register_time], dim=1)
+                register_count = full_length - action_length - 1
+                if register_count < 0:
+                    raise ValueError("full_length cannot be shorter than state + actions")
+                state_time = action_t[:, :1]
+                register_time = action_t[:, -1:].expand(-1, register_count)
+                expanded = torch.cat([state_time, action_t, register_time], dim=1)
         else:
             raise ValueError(
                 "action_t must be scalar, [B], [B,1], or [B,action_chunk_size]"
@@ -604,6 +647,7 @@ class OVCRSActionGenerator(nn.Module):
         self,
         noisy_action: torch.Tensor,
         action_t: torch.Tensor,
+        initial_state: torch.Tensor,
         conditioning: Mapping[str, Any],
         *,
         return_trace: bool = False,
@@ -621,7 +665,9 @@ class OVCRSActionGenerator(nn.Module):
             if self.action_expert.registers is not None
             else None
         )
-        action_tokens = self.action_expert.input_encoder(noisy_action, registers)
+        action_tokens = self.action_expert.input_encoder(
+            initial_state, noisy_action, registers
+        )
         action_length = int(noisy_action.shape[1])
         time_embedding, time_modulation = self._time_conditioning(
             action_t, action_length, int(action_tokens.shape[1])
@@ -637,11 +683,11 @@ class OVCRSActionGenerator(nn.Module):
             )
             layer_number = layer_index + 1
             if layer_number in trace_set:
-                responses[layer_number] = response[:, :action_length]
+                responses[layer_number] = response[:, 1 : 1 + action_length]
         prediction = self.action_expert.decoder(action_tokens, time_embedding)
         outputs: dict[str, Any] = {
-            "action_velocity": prediction[:, :action_length],
-            "action_hidden": action_tokens[:, :action_length],
+            "action_velocity": prediction[:, 1 : 1 + action_length],
+            "action_hidden": action_tokens[:, 1 : 1 + action_length],
         }
         if return_trace:
             outputs["action_responses"] = responses
@@ -651,6 +697,7 @@ class OVCRSActionGenerator(nn.Module):
         self,
         noisy_action: torch.Tensor,
         action_t: torch.Tensor,
+        initial_state: torch.Tensor,
         observation_tokens: torch.Tensor,
         video_kv_cache: Sequence[Mapping[str, torch.Tensor]],
         observation_mask: torch.Tensor | None = None,
@@ -664,7 +711,11 @@ class OVCRSActionGenerator(nn.Module):
             return_trace=return_trace,
         )
         outputs = self.predict_velocity(
-            noisy_action, action_t, conditioning, return_trace=return_trace
+            noisy_action,
+            action_t,
+            initial_state,
+            conditioning,
+            return_trace=return_trace,
         )
         outputs["queries"] = conditioning["queries"]
         if return_trace:
@@ -676,6 +727,7 @@ class OVCRSActionGenerator(nn.Module):
         self,
         observation_tokens: torch.Tensor,
         video_kv_cache: Sequence[Mapping[str, torch.Tensor]],
+        initial_state: torch.Tensor,
         observation_mask: torch.Tensor | None = None,
         *,
         num_steps: int = 4,
@@ -713,7 +765,11 @@ class OVCRSActionGenerator(nn.Module):
                 current_sigma * self.config.num_train_timesteps
             ).expand(batch_size).to(dtype=parameter.dtype)
             velocity = self.predict_velocity(
-                action, action_t, conditioning, return_trace=False
+                action,
+                action_t,
+                initial_state,
+                conditioning,
+                return_trace=False,
             )["action_velocity"]
             action = action + velocity * (next_sigma - current_sigma).to(action.dtype)
         return action

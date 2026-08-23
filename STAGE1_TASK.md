@@ -2,20 +2,19 @@
 
 ## 任务目标
 
-冻结已训练的 AHA-WAM 教师，把它的动作生成行为蒸馏到 OVCR-S 学生。Stage 1 只训练动作生成模型，不训练安全分类头，也不需要风险标签。
+冻结已训练的 AHA-WAM 教师，把它的最终动作行为蒸馏到 Efficient-WAM-S 尺寸的 OVCR-S 学生。Stage 1 只训练动作生成模型，不训练安全分类头，也不需要风险标签。
 
 学生接收以下张量：
 
-- 当前观察对应的 VAE latent tokens；
-- 从 AHA 视频骨干按层、按完整 attention head 切出的首帧 K/V；
-- 带噪动作 chunk 和动作时间步。
+- Efficient-WAM VAE 编码的当前观察 latent tokens；
+- 冻结 Efficient 视频骨干真实产生的完整 12 层 K/V，包含当前帧和想象未来；
+- Efficient 归一化空间内的当前状态、带噪动作 chunk 和动作时间步。
 
-学生输出 16×14 的动作 flow velocity。训练完成后保存的权重只包含 OVCR-S 学生，不包含 AHA 教师。
+AHA 只提供最终动作样本。AHA 动作和数据集动作先还原到物理 qpos，再转入 Efficient 的归一化空间。学生输出 16×14 的动作 flow velocity。训练完成后保存的权重只包含 OVCR-S 学生，不包含两个冻结模型。
 
 ## 固定网络结构
 
 - 视频 K/V：12 层，2048 维，16 heads × 128；
-- AHA 层映射：`[1, 2, 4, 6, 8, 11, 14, 17, 20, 23, 26, 30]`；
 - 观察查询：32 queries，query dim 512；
 - K/V 编辑器：共享低秩编辑器，rank 256，逐层 gate 初始值 -4；
 - 动作专家：12 层，hidden dim 768，FFN dim 3072；
@@ -29,6 +28,7 @@
 - 学生网络：`safety_verify_wam.stage1.OVCRSActionGenerator`
 - AHA 教师适配：`safety_verify_wam.stage1.AHAOVCRTeacherAdapter`
 - AHA Trainer 兼容模型：`safety_verify_wam.stage1.AHAOVCRSStage1Program`
+- Efficient 训练输入：`safety_verify_wam.stage1.efficient_training.EfficientStudentTrainingAdapter`
 - Hydra 工厂：`safety_verify_wam.stage1.create_aha_ovcr_s_stage1`
 
 `AHAOVCRSStage1Program.training_loss(sample)` 可以直接接入 AHA-WAM 已有的 `Wan22Trainer` 和 RoboTwin 数据加载器。
@@ -41,8 +41,8 @@
    - `AHAWAM._predict_action_flow_with_video_state`；
    - `LayerwiseChunkKVCacheEditor.build_layer_updated_cache`。
 3. 在 AHA 环境中执行 `pip install -e <Safety-Verify-WAM>`。
-4. 准备 AHA-WAM checkpoint、Efficient-WAM 动作专家 checkpoint、Wan2.2 权重、RoboTwin 数据集和 normalization statistics。
-5. 从 AHA 的 `configs/model/ahawam_ode.yaml` 保留完整 teacher 配置，将顶层模型换成 `create_aha_ovcr_s_stage1`；删除原来的 AHA student 配置，并把本仓库 YAML 中的 `student`、`teacher_distillation`、`loss` 分别传给工厂对应参数。
+4. 准备 AHA-WAM checkpoint、完整 Efficient-WAM checkpoint、Wan2.2 权重、RoboTwin 数据集，以及 AHA/Efficient 两套 normalization statistics。
+5. 从 AHA 的 `configs/model/ahawam_ode.yaml` 保留完整 teacher 配置，将顶层模型换成 `create_aha_ovcr_s_stage1`；传入 `student_config`、`loss_config` 和 `efficient_conditioning`。后者必须包含 Efficient 部署配置、两套 statistics 路径和 Efficient Python 根目录。
 6. Efficient-WAM 动作专家 checkpoint 传给 `efficient_action_checkpoint`。正式训练优先使用该初始化；随机初始化只用于接口检查或对照实验。
 
 AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同数量提供历史帧。所有路径写进服务器本地配置，checkpoint、数据和输出目录不得加入 Git。
@@ -53,7 +53,7 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 - AHA checkpoint 是否严格加载；
 - Efficient 动作专家成功加载、缺失和形状不一致的 tensor 数量；
-- observation tokens、12 层 K/V、teacher queries、动作响应和输出动作的实际 shape；
+- observation tokens、完整 12 层 K/V、当前状态和输出动作的实际 shape；
 - 教师所有参数 `requires_grad=False`；
 - query encoder、K/V editor、动作 block 1/6/12、action decoder 的梯度范数；
 - 单卡或每个 rank 的峰值显存、forward 时间和 backward 时间。
@@ -62,11 +62,12 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 | 张量 | Shape |
 | --- | --- |
-| observation tokens | `[B, 1, S_obs, 48]` |
+| observation tokens | `[B, S_obs, 48]` |
 | compact video K/V | 12 × `[B, S_video, 2048]` |
 | student queries | `[B, 1, 32, 512]` |
 | updated K/V | 12 × `[B, 1, S_video, 2048]` |
 | noisy/predicted action | `[B, 16, 14]` |
+| initial state | `[B, 14]` |
 
 出现 shape 错误、NaN/Inf、教师梯度、学生完全没有梯度或 OOM 时，先停止并保存完整错误日志，不要直接降低网络尺寸。
 
@@ -82,7 +83,7 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 - 每 50 steps 在同一验证子集评估；
 - 保存短训练结束 checkpoint。
 
-短训练中总损失、动作 velocity、teacher-action 和 response 损失应出现下降趋势。通过后再运行正式训练。
+短训练中总损失、动作 velocity 和 teacher-action 损失应出现下降趋势，preservation 损失不能持续发散。通过后再运行正式训练。
 
 ### 正式训练
 
@@ -104,19 +105,15 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 L = 1.00 L_velocity
   + 1.00 L_teacher_action
   + 0.25 L_ground_truth_action
-  + 0.05 L_query
-  + 0.10 L_route
-  + 0.10 L_delta_KV
-  + 0.25 L_action_response
+  + 0.25 L_preservation
 ```
 
-- `velocity`：学生和 AHA 在相同带噪动作、相同时间步下的 flow velocity MSE；
-- `teacher_action`：学生一步还原动作和 AHA 最终 rollout 动作的 MSE；
+- `velocity`：以 AHA 最终动作为干净样本，在 Efficient 空间重新加噪后得到的 flow target MSE；
+- `teacher_action`：学生一步还原动作和 AHA 最终 rollout 动作的 MSE，二者都在 Efficient 空间；
 - `ground_truth_action`：学生一步还原动作和数据集动作的 MSE；
-- `query`：学生观察查询和降维后 AHA 查询的 cosine loss；
-- `route`：查询首帧 K/V 时的 attention distribution KL；
-- `delta_KV`：逐层有效 K/V 增量方向的 cosine loss；
-- `action_response`：动作 Q 查询更新后 K/V 得到的响应 cosine loss。
+- `preservation`：学生和冻结原 Efficient 动作专家在同一 K/V、状态、噪声和时间步下的 velocity MSE。
+
+AHA query、route、K/V delta 和 response 属于另一套骨干特征空间，不能直接监督 Efficient K/V，因此这些损失在该路线中固定为 0。
 
 ## 需要回传的结果
 
@@ -145,13 +142,12 @@ L = 1.00 L_velocity
 - step 10 以后，query encoder、editor、动作早/中/晚层和 decoder 均出现非零梯度；
 - best `val_loss_teacher_action` 相比 `step_000000` 至少下降 20%；
 - best `val_loss_velocity` 相比 `step_000000` 至少下降 15%；
-- best `val_loss_response` 相比 `step_000000` 至少下降 15%；
-- `val_loss_route` 有持续下降，`val_loss_delta` 没有持续发散；
+- `val_loss_preservation` 没有持续发散；
 - 固定噪声下的多步 student-vs-teacher action MSE 相比未训练学生至少下降 20%；
 - student action 的逐维标准差没有坍缩，建议保持在 teacher 对应标准差的 0.5～1.5 倍；
 - 训练集下降但验证集没有改善，不能判定有效。
 
-如果 teacher-action、velocity 和 response 三项达到上述条件，可以进入下一阶段：把训练后的 OVCR-S 接到 Efficient 视频骨干产生的真实 12 层 K/V 上，先验证动作生成，再训练三分类安全头。Stage 1 的结果只能说明动作和动力学查询蒸馏有效，不能说明风险判别已经有效。
+离线条件通过后，直接使用同一套 Efficient 完整 K/V 部署路径做配对闭环任务测试。Stage 1 的结果只能说明动作行为蒸馏有效，不能说明风险判别已经有效。
 
 ## 实验交付
 

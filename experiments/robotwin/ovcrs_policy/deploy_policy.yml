@@ -4,7 +4,6 @@ task_name: adjust_bottle
 task_config: demo_clean
 ckpt_setting: /path/to/Efficient-WAM_stage3.pt
 ovcrs_checkpoint: /path/to/best_fixed_panel.pt
-aha_dataset_stats_path: /path/to/aha_dataset_stats.json
 wan_path: /path/to/Wan2.2-TI2V-5B-runtime
 device: cuda
 seed: 42
@@ -50,3 +49,4 @@ model:
 
 ovcrs_precision: bf16
 observation_downsample_factor: 1
+condition_only_video_cache: false
