@@ -4,7 +4,10 @@ import unittest
 
 import torch
 
-from safety_verify_wam.stage1.aha_teacher import AHAOVCRSTeacherBatch
+from safety_verify_wam.stage1.aha_teacher import (
+    AHAOVCRSTeacherBatch,
+    GroundTruthTargetAdapter,
+)
 from safety_verify_wam.stage1.distill import (
     AHAOVCRSStage1Program,
     Stage1LossConfig,
@@ -15,6 +18,65 @@ from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class Stage1DistillationLossTest(unittest.TestCase):
+    def test_ground_truth_adapter_builds_chunks_without_teacher(self) -> None:
+        config = OVCRSConfig(
+            observation_dim=2,
+            query_dim=4,
+            num_queries=2,
+            video_dim=4,
+            num_heads=1,
+            head_dim=4,
+            num_layers=1,
+            editor_rank=2,
+            state_dim=2,
+            action_dim=2,
+            action_hidden_dim=4,
+            action_ffn_dim=8,
+            action_chunk_size=2,
+            num_registers=1,
+            time_embedding_dim=4,
+            distill_layers=(1,),
+        )
+        adapter = GroundTruthTargetAdapter(
+            config,
+            action_horizon=4,
+            device="cpu",
+        )
+        action = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2)
+        proprio = action + 100.0
+        sample = {
+            "action": action,
+            "proprio": proprio,
+            "action_is_pad": torch.tensor(
+                [[False, False, True, True], [False, False, False, False]]
+            ),
+            "stage1_chunk_index": torch.tensor([0, 1]),
+        }
+
+        targets = adapter.prepare_batch(sample)
+
+        torch.testing.assert_close(targets.ground_truth_action[0], action[0, :2])
+        torch.testing.assert_close(targets.ground_truth_action[1], action[1, 2:])
+        torch.testing.assert_close(targets.teacher_action, targets.ground_truth_action)
+        torch.testing.assert_close(targets.initial_state[0], proprio[0, 0])
+        torch.testing.assert_close(targets.initial_state[1], proprio[1, 2])
+        self.assertEqual(targets.action_is_pad.tolist(), [[False, False], [False, False]])
+        self.assertEqual(adapter.teacher_layer_mapping, ())
+        self.assertEqual(sum(parameter.numel() for parameter in adapter.parameters()), 0)
+
+    def test_ground_truth_adapter_rejects_action_offset(self) -> None:
+        adapter = GroundTruthTargetAdapter(
+            OVCRSConfig(), action_horizon=64, device="cpu"
+        )
+        with self.assertRaisesRegex(ValueError, "action_offset"):
+            adapter.prepare_batch(
+                {
+                    "action": torch.zeros(1, 64, 14),
+                    "proprio": torch.zeros(1, 64, 14),
+                    "action_offset": torch.zeros(1, dtype=torch.long),
+                }
+            )
+
     def test_editor_only_view_survives_aha_trainer_freeze_sequence(self) -> None:
         config = OVCRSConfig(
             observation_dim=2,

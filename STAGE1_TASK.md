@@ -1,8 +1,8 @@
-# Stage 1：AHA-WAM → OVCR-S 动作生成模型
+# Stage 1：Efficient 尺寸 OVCR-S 动作生成模型
 
 ## 任务目标
 
-冻结已训练的 AHA-WAM 教师，把它的最终动作行为蒸馏到 Efficient-WAM-S 尺寸的 OVCR-S 学生。Stage 1 只训练动作生成模型，不训练安全分类头，也不需要风险标签。
+最终学生固定为 Efficient-WAM-S 尺寸。当前主训练直接使用 RoboTwin 真实动作做 flow matching，冻结已有 Efficient 动作专家，只训练新增的 query encoder 和 K/V editor。AHA-WAM 不参与这一阶段的在线前向；它只在后续 response distillation 对照中提供动作注意力响应。Stage 1 不训练安全分类头，也不需要风险标签。
 
 学生接收以下张量：
 
@@ -10,7 +10,7 @@
 - 冻结 Efficient 视频骨干真实产生的完整 12 层 K/V，包含当前帧和想象未来；
 - Efficient 归一化空间内的当前状态、带噪动作 chunk 和动作时间步。
 
-AHA 只提供最终动作样本。AHA 动作和数据集动作先还原到物理 qpos，再转入 Efficient 的归一化空间。学生输出 16×14 的动作 flow velocity。训练完成后保存的权重只包含 OVCR-S 学生，不包含两个冻结模型。
+数据集动作先从 AHA 数据加载器的归一化空间还原到物理 qpos，再转入 Efficient 的归一化空间。每个 batch 在 1000 档 shifted flow scheduler 中均匀采样噪声等级，学生输出 16×14 的动作 flow velocity。训练完成后只保存 OVCR-S 学生权重，不保存冻结的 Efficient 视频模型。
 
 ## 固定网络结构
 
@@ -29,20 +29,21 @@ AHA 只提供最终动作样本。AHA 动作和数据集动作先还原到物理
 - AHA 教师适配：`safety_verify_wam.stage1.AHAOVCRTeacherAdapter`
 - AHA Trainer 兼容模型：`safety_verify_wam.stage1.AHAOVCRSStage1Program`
 - Efficient 训练输入：`safety_verify_wam.stage1.efficient_training.EfficientStudentTrainingAdapter`
-- Hydra 工厂：`safety_verify_wam.stage1.create_aha_ovcr_s_stage1`
+- 真实动作训练工厂：`safety_verify_wam.stage1.create_ground_truth_ovcr_s_stage1`
+- AHA 在线蒸馏工厂：`safety_verify_wam.stage1.create_aha_ovcr_s_stage1`
 
-`AHAOVCRSStage1Program.training_loss(sample)` 可以直接接入 AHA-WAM 已有的 `Wan22Trainer` 和 RoboTwin 数据加载器。
+两个工厂都返回 `AHAOVCRSStage1Program`，可以直接接入 AHA-WAM 已有的 `Wan22Trainer` 和 RoboTwin 数据加载器。真实动作工厂使用轻量 `GroundTruthTargetAdapter`，不会实例化 AHA 教师。
 
 ## 服务器准备
 
 1. 完整克隆本仓库 `main`，记录 commit SHA；不要使用不完整源码副本。
-2. 完整克隆官方 AHA-WAM，并记录 commit SHA。所用版本必须包含：
+2. 完整克隆官方 AHA-WAM，并记录 commit SHA。主训练只复用其 Trainer 和数据加载器；后续 response distillation 所用版本必须包含：
    - `AHAWAMTeacher.rollout_action_latent_states`；
    - `AHAWAM._predict_action_flow_with_video_state`；
    - `LayerwiseChunkKVCacheEditor.build_layer_updated_cache`。
 3. 在 AHA 环境中执行 `pip install -e <Safety-Verify-WAM>`。
 4. 准备 AHA-WAM checkpoint、完整 Efficient-WAM checkpoint、Wan2.2 权重、RoboTwin 数据集，以及 AHA/Efficient 两套 normalization statistics。
-5. 从 AHA 的 `configs/model/ahawam_ode.yaml` 保留完整 teacher 配置，将顶层模型换成 `create_aha_ovcr_s_stage1`；传入 `student_config`、`loss_config` 和 `efficient_conditioning`。后者必须包含 Efficient 部署配置、两套 statistics 路径和 Efficient Python 根目录。
+5. 主训练将顶层模型换成 `create_ground_truth_ovcr_s_stage1`，不传 `teacher`；传入 `student_config`、`loss_config` 和 `efficient_conditioning`。后者必须包含 Efficient 部署配置、两套 statistics 路径和 Efficient Python 根目录。
 6. Efficient-WAM 动作专家 checkpoint 传给 `efficient_action_checkpoint`。正式训练优先使用该初始化；随机初始化只用于接口检查或对照实验。
 
 AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同数量提供历史帧。所有路径写进服务器本地配置，checkpoint、数据和输出目录不得加入 Git。
@@ -51,7 +52,7 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 先执行一个 batch 的 forward/backward，不保存正式结果。必须记录：
 
-- AHA checkpoint 是否严格加载；
+- 主训练确认没有实例化 AHA；response distillation 才检查 AHA checkpoint 是否严格加载；
 - Efficient 动作专家成功加载、缺失和形状不一致的 tensor 数量；
 - observation tokens、完整 12 层 K/V、当前状态和输出动作的实际 shape；
 - 教师所有参数 `requires_grad=False`；
@@ -73,18 +74,18 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 ## 训练顺序
 
-### 短训练
+### 方向检查
 
 - 固定训练和验证样本清单；
 - 固定 seed 42；
 - 单卡 AdamW 使用 FP32 学生主权重和优化器状态，前向仍使用 BF16 autocast；
 - 在更新参数前完成一次验证，记为 `step_000000`；
-- 训练 100～300 optimizer steps；
+- 训练 100～300 optimizer steps，仅用于检查梯度、数值和数据路径；
 - 每 10 steps 记录所有分项损失和梯度范数；
 - 每 50 steps 在同一验证子集评估；
 - 保存短训练结束 checkpoint。
 
-短训练中总损失、动作 velocity 和 teacher-action 损失应出现下降趋势，preservation 损失不能持续发散。通过后再运行正式训练。
+200 步、batch 32 只看到 6400 个窗口，不能据此判断最终任务效果。方向检查通过后，先跑 2000 optimizer steps；这一轮使用 constant LR，避免把完整 cosine 周期压缩进短实验。
 
 ### 正式训练
 
@@ -100,21 +101,17 @@ AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同�
 
 ## 损失含义
 
-默认总损失为：
+当前真实动作阶段的总损失为：
 
 ```text
-L = 1.00 L_velocity
-  + 1.00 L_teacher_action
-  + 0.25 L_ground_truth_action
-  + 0.25 L_preservation
+L = 1.00 L_GT-flow
 ```
 
-- `velocity`：以 AHA 最终动作为干净样本，在 Efficient 空间重新加噪后得到的 flow target MSE；
-- `teacher_action`：学生一步还原动作和 AHA 最终 rollout 动作的 MSE，二者都在 Efficient 空间；
-- `ground_truth_action`：学生一步还原动作和数据集动作的 MSE；
-- `preservation`：学生和冻结原 Efficient 动作专家在同一 K/V、状态、噪声和时间步下的 velocity MSE。
+- `GT-flow`：以 RoboTwin 真实动作为干净样本，在 Efficient 空间重新加噪；目标 velocity 为 `noise - action`，与 Efficient-WAM 官方动作训练代码一致；
+- 该阶段冻结 Efficient 动作专家，只更新 query encoder 和 K/V editor；
+- teacher-action、query、route、K/V delta、preservation 和 response 权重均为 0。
 
-AHA query、route、K/V delta 和 response 属于另一套骨干特征空间，不能直接监督 Efficient K/V，因此这些损失在该路线中固定为 0。
+后续 AHA response distillation 保持 GT-flow 权重 1.0，只增加映射层 `[3, 6, 9, 12]` 的动作 attention response cosine。教师和学生 response 先投影到 256 维，KD 权重按 `0.2 → 0.1 → 0` 退火。该阶段需单独实验分支和结果，不能与 GT-only 结果混记。
 
 ## 需要回传的结果
 
@@ -141,10 +138,10 @@ AHA query、route、K/V delta 和 response 属于另一套骨干特征空间，�
 
 - 所有损失和梯度保持有限值，没有 NaN/Inf；
 - step 10 以后，query encoder、editor、动作早/中/晚层和 decoder 均出现非零梯度；
-- best `val_loss_teacher_action` 相比 `step_000000` 至少下降 20%；
-- best `val_loss_velocity` 相比 `step_000000` 至少下降 15%；
+- GT-only 组以固定验证集 `val_loss_velocity` 和 `val_loss_ground_truth_action` 为主要离线指标；
+- AHA response 组另外报告映射层 response cosine，不能用它替代真实动作误差；
 - `val_loss_preservation` 没有持续发散；
-- 固定噪声下的多步 student-vs-teacher action MSE 相比未训练学生至少下降 20%；
+- 固定噪声下的多步 student-vs-GT action MSE 相比未训练学生应下降；
 - student action 的逐维标准差没有坍缩，建议保持在 teacher 对应标准差的 0.5～1.5 倍；
 - 训练集下降但验证集没有改善，不能判定有效。
 

@@ -8,7 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .aha_teacher import AHAOVCRSTeacherBatch, AHAOVCRTeacherAdapter
+from .aha_teacher import (
+    AHAOVCRSTeacherBatch,
+    AHAOVCRTeacherAdapter,
+    GroundTruthTargetAdapter,
+)
 from .ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
@@ -275,7 +279,7 @@ class AHAOVCRSStage1Program(nn.Module):
 
     def __init__(
         self,
-        teacher_adapter: AHAOVCRTeacherAdapter,
+        teacher_adapter: nn.Module,
         student: OVCRSActionGenerator,
         loss_config: Stage1LossConfig,
         efficient_training_adapter: nn.Module | None = None,
@@ -392,6 +396,9 @@ class AHAOVCRSStage1Program(nn.Module):
             "loss_config": self.loss_config.to_dict(),
             "teacher_layer_mapping": list(
                 self.teacher_adapter.teacher_layer_mapping
+            ),
+            "target_source": getattr(
+                self.teacher_adapter, "target_source", "aha_teacher"
             ),
             "step": step,
         }
@@ -578,6 +585,109 @@ def create_aha_ovcr_s_stage1(
                 "Stage 1 num_history_frames differs from the AHA teacher: "
                 f"{num_history_frames} vs {actual_history}"
             )
+    return AHAOVCRSStage1Program(
+        adapter,
+        student,
+        resolved_loss_config,
+        efficient_training_adapter=efficient_training_adapter,
+    )
+
+
+def create_ground_truth_ovcr_s_stage1(
+    *,
+    student_config: Mapping[str, Any] | OVCRSConfig | None = None,
+    loss_config: Mapping[str, Any] | Stage1LossConfig | None = None,
+    action_horizon: int = 64,
+    sigma_shift: float | None = None,
+    efficient_action_checkpoint: str | Path | None = None,
+    strict_action_init: bool = True,
+    efficient_conditioning: Mapping[str, Any] | None = None,
+    student_parameter_dtype: str | torch.dtype | None = None,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cuda",
+) -> AHAOVCRSStage1Program:
+    """Create dataset-flow training without instantiating an AHA teacher."""
+
+    if sigma_shift is not None:
+        raise ValueError(
+            "Ground-truth-only Stage 1 takes action_sigma_shift from "
+            "efficient_conditioning"
+        )
+    if efficient_conditioning is None:
+        raise ValueError("Ground-truth-only Stage 1 requires efficient_conditioning")
+    conditioning = dict(efficient_conditioning)
+    if conditioning.get("action_flow_target") != "ground_truth":
+        raise ValueError(
+            "Ground-truth-only Stage 1 requires action_flow_target='ground_truth'"
+        )
+    if conditioning.get("action_noise_sampling") != "uniform_shifted":
+        raise ValueError(
+            "Ground-truth-only Stage 1 requires action_noise_sampling='uniform_shifted'"
+        )
+
+    if student_config is None:
+        resolved_student_config = OVCRSConfig()
+    elif isinstance(student_config, OVCRSConfig):
+        resolved_student_config = student_config
+    else:
+        resolved_student_config = OVCRSConfig(**dict(student_config))
+    if loss_config is None:
+        resolved_loss_config = Stage1LossConfig()
+    elif isinstance(loss_config, Stage1LossConfig):
+        resolved_loss_config = loss_config
+    else:
+        resolved_loss_config = Stage1LossConfig(**dict(loss_config))
+    unsupported_weights = {
+        "teacher_action_weight": resolved_loss_config.teacher_action_weight,
+        "query_weight": resolved_loss_config.query_weight,
+        "route_weight": resolved_loss_config.route_weight,
+        "delta_weight": resolved_loss_config.delta_weight,
+        "response_weight": resolved_loss_config.response_weight,
+    }
+    enabled_unsupported = {
+        name: weight for name, weight in unsupported_weights.items() if weight > 0
+    }
+    if enabled_unsupported:
+        raise ValueError(
+            "Ground-truth-only Stage 1 cannot compute AHA teacher losses; "
+            f"set these weights to zero: {enabled_unsupported}"
+        )
+
+    student = OVCRSActionGenerator(resolved_student_config)
+    if efficient_action_checkpoint not in (None, "", "null"):
+        checkpoint_path = Path(efficient_action_checkpoint).expanduser()
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError(
+                f"Efficient action checkpoint must contain a mapping: {checkpoint_path}"
+            )
+        student.load_efficient_action_expert(
+            checkpoint, strict=bool(strict_action_init)
+        )
+    resolved_parameter_dtype = _resolve_parameter_dtype(
+        student_parameter_dtype,
+        fallback=model_dtype,
+    )
+    student.to(device=torch.device(device), dtype=resolved_parameter_dtype)
+
+    from .efficient_training import EfficientStudentTrainingAdapter
+
+    efficient_training_adapter = EfficientStudentTrainingAdapter(
+        student=student,
+        device=device,
+        student_dtype=model_dtype,
+        **conditioning,
+    )
+    adapter = GroundTruthTargetAdapter(
+        resolved_student_config,
+        action_horizon=action_horizon,
+        device=device,
+    )
     return AHAOVCRSStage1Program(
         adapter,
         student,

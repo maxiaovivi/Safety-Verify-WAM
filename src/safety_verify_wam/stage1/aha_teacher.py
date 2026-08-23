@@ -93,6 +93,173 @@ def _gather_action_chunk(
     return _gather_chunk_tokens(chunks, chunk_index)[:, 0]
 
 
+def _choose_chunk_indices(
+    sample: Mapping[str, Any],
+    *,
+    batch_size: int,
+    num_chunks: int,
+    student_config: OVCRSConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    requested = sample.get("stage1_chunk_index")
+    if requested is None:
+        action_is_pad = sample.get("action_is_pad")
+        if isinstance(action_is_pad, torch.Tensor) and tuple(
+            action_is_pad.shape[:2]
+        ) == (batch_size, num_chunks * student_config.action_chunk_size):
+            valid_chunks = (~action_is_pad.to(device=device, dtype=torch.bool)).view(
+                batch_size, num_chunks, student_config.action_chunk_size
+            ).any(dim=-1)
+            if not valid_chunks.any(dim=-1).all():
+                raise ValueError("Every sample needs at least one non-padding action chunk")
+            return torch.multinomial(valid_chunks.float(), 1).squeeze(1)
+        return torch.randint(num_chunks, (batch_size,), device=device)
+    indices = torch.as_tensor(requested, device=device, dtype=torch.long)
+    if indices.ndim == 0:
+        indices = indices.expand(batch_size)
+    if tuple(indices.shape) != (batch_size,):
+        raise ValueError("stage1_chunk_index must be scalar or [B]")
+    if (indices < 0).any() or (indices >= num_chunks).any():
+        raise ValueError("stage1_chunk_index is outside the action horizon")
+    return indices
+
+
+class GroundTruthTargetAdapter(nn.Module):
+    """Build compact action targets directly from a RoboTwin data batch.
+
+    This adapter intentionally has no teacher model. Efficient-WAM supplies the
+    deployment-matched video cache and replaces the placeholder flow tensors in
+    ``EfficientStudentTrainingAdapter.prepare_batch``.
+    """
+
+    def __init__(
+        self,
+        student_config: OVCRSConfig,
+        *,
+        action_horizon: int,
+        device: str | torch.device = "cuda",
+    ) -> None:
+        super().__init__()
+        self.student_config = student_config
+        self.teacher_layer_mapping: tuple[int, ...] = ()
+        self.target_source = "ground_truth"
+        self.action_horizon = int(action_horizon)
+        self.device_name = str(device)
+        if self.action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+        if self.action_horizon % self.student_config.action_chunk_size:
+            raise ValueError("action_horizon must be divisible by action_chunk_size")
+
+    def train(self, mode: bool = True) -> "GroundTruthTargetAdapter":
+        super().train(False)
+        return self
+
+    @torch.no_grad()
+    def prepare_batch(
+        self,
+        sample: dict[str, Any],
+        *,
+        tiled: bool = False,
+    ) -> AHAOVCRSTeacherBatch:
+        del tiled
+        if "action_offset" in sample:
+            raise ValueError(
+                "Ground-truth-only Stage 1 does not support action_offset batches"
+            )
+        action = sample.get("action")
+        if not isinstance(action, torch.Tensor) or action.ndim != 3:
+            raise ValueError("sample['action'] must be [B,T,D]")
+        batch_size, action_horizon, action_dim = action.shape
+        if action_horizon != self.action_horizon:
+            raise ValueError(
+                "Dataset action horizon differs from the configured horizon: "
+                f"{action_horizon} vs {self.action_horizon}"
+            )
+        if action_dim != self.student_config.action_dim:
+            raise ValueError(
+                "Dataset action dim differs from the Efficient student: "
+                f"{action_dim} vs {self.student_config.action_dim}"
+            )
+
+        device = torch.device(self.device_name)
+        action = action.detach().to(device=device, dtype=torch.float32)
+        chunk_size = self.student_config.action_chunk_size
+        num_chunks = action_horizon // chunk_size
+        chunk_index = _choose_chunk_indices(
+            sample,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            student_config=self.student_config,
+            device=device,
+        )
+        ground_truth_chunk = _gather_action_chunk(action, chunk_index, chunk_size)
+
+        proprio = sample.get("proprio")
+        if not isinstance(proprio, torch.Tensor) or proprio.ndim != 3:
+            raise ValueError("sample['proprio'] must be [B,T,D]")
+        if (
+            proprio.shape[0] != batch_size
+            or proprio.shape[-1] != self.student_config.state_dim
+        ):
+            raise ValueError(
+                "Dataset proprio shape differs from the Efficient student: "
+                f"{tuple(proprio.shape)}"
+            )
+        state_indices = (chunk_index * chunk_size).clamp_max(proprio.shape[1] - 1)
+        initial_state = torch.gather(
+            proprio.to(device=device, dtype=torch.float32),
+            dim=1,
+            index=state_indices.view(batch_size, 1, 1).expand(
+                -1, 1, self.student_config.state_dim
+            ),
+        )[:, 0]
+
+        action_is_pad = sample.get("action_is_pad")
+        if isinstance(action_is_pad, torch.Tensor) and tuple(
+            action_is_pad.shape[:2]
+        ) == (batch_size, action_horizon):
+            action_is_pad = _gather_action_chunk(
+                action_is_pad.to(device=device, dtype=torch.bool),
+                chunk_index,
+                chunk_size,
+            )
+        else:
+            action_is_pad = None
+
+        placeholder_observation = torch.zeros(
+            (batch_size, 1, self.student_config.observation_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        placeholder_queries = torch.zeros(
+            (batch_size, 1, self.student_config.num_queries, self.student_config.query_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        zeros = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        return AHAOVCRSTeacherBatch(
+            noisy_action=ground_truth_chunk,
+            action_t=zeros,
+            sigma=zeros,
+            teacher_velocity=torch.zeros_like(ground_truth_chunk),
+            teacher_action=ground_truth_chunk,
+            ground_truth_action=ground_truth_chunk,
+            initial_state=initial_state,
+            reference_velocity=None,
+            observation_tokens=placeholder_observation,
+            observation_mask=torch.ones(
+                placeholder_observation.shape[:-1], device=device, dtype=torch.bool
+            ),
+            video_kv_cache=tuple(),
+            teacher_queries=placeholder_queries,
+            teacher_editor_trace={},
+            teacher_action_responses={},
+            action_is_pad=action_is_pad,
+            chunk_index=chunk_index,
+            anchor_step=torch.zeros(batch_size, device=device, dtype=torch.long),
+        )
+
+
 class AHAOVCRTeacherAdapter(nn.Module):
     """Run AHA online and expose compact, structured-sliced OVCR targets.
 
@@ -353,27 +520,13 @@ class AHAOVCRTeacherAdapter(nn.Module):
         num_chunks: int,
         device: torch.device,
     ) -> torch.Tensor:
-        requested = sample.get("stage1_chunk_index")
-        if requested is None:
-            action_is_pad = sample.get("action_is_pad")
-            if isinstance(action_is_pad, torch.Tensor) and tuple(
-                action_is_pad.shape[:2]
-            ) == (batch_size, num_chunks * self.student_config.action_chunk_size):
-                valid_chunks = (~action_is_pad.to(device=device, dtype=torch.bool)).view(
-                    batch_size, num_chunks, self.student_config.action_chunk_size
-                ).any(dim=-1)
-                if not valid_chunks.any(dim=-1).all():
-                    raise ValueError("Every sample needs at least one non-padding action chunk")
-                return torch.multinomial(valid_chunks.float(), 1).squeeze(1)
-            return torch.randint(num_chunks, (batch_size,), device=device)
-        indices = torch.as_tensor(requested, device=device, dtype=torch.long)
-        if indices.ndim == 0:
-            indices = indices.expand(batch_size)
-        if tuple(indices.shape) != (batch_size,):
-            raise ValueError("stage1_chunk_index must be scalar or [B]")
-        if (indices < 0).any() or (indices >= num_chunks).any():
-            raise ValueError("stage1_chunk_index is outside the action horizon")
-        return indices
+        return _choose_chunk_indices(
+            sample,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            student_config=self.student_config,
+            device=device,
+        )
 
     @torch.no_grad()
     def _prepare_action_only_batch(
