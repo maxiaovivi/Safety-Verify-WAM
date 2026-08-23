@@ -183,6 +183,20 @@ def main() -> int:
         for name, parameter in model.student.named_parameters()
         if not parameter.requires_grad
     ]
+    input_encoder_activations: list[torch.Tensor] = []
+
+    def record_input_encoder_activation(
+        _module: torch.nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        if output.requires_grad:
+            output.retain_grad()
+        input_encoder_activations.append(output)
+
+    input_encoder_hook = model.student.action_expert.input_encoder.register_forward_hook(
+        record_input_encoder_activation
+    )
     report["model_and_dataset_init_seconds"] = time.perf_counter() - initialized
     report["trainable_parameters"] = sum(parameter.numel() for parameter in parameters)
     report["student_parameter_dtypes"] = sorted(
@@ -193,6 +207,7 @@ def main() -> int:
 
     try:
         for step, sample in enumerate(loader, start=1):
+            input_encoder_activations.clear()
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.reset_peak_memory_stats(0)
             started = time.perf_counter()
@@ -232,6 +247,18 @@ def main() -> int:
                 "samples_per_second": args.batch_size / total_seconds,
                 "peak_allocated_mib": torch.cuda.max_memory_allocated(0) / (1024 * 1024),
                 "peak_reserved_mib": torch.cuda.max_memory_reserved(0) / (1024 * 1024),
+                "input_encoder_activations": [
+                    {
+                        "requires_grad": activation.requires_grad,
+                        "has_grad": activation.grad is not None,
+                        "grad_norm": (
+                            float(activation.grad.float().norm().item())
+                            if activation.grad is not None
+                            else 0.0
+                        ),
+                    }
+                    for activation in input_encoder_activations
+                ],
             }
             row["finite"] = bool(np.isfinite(row["loss"])) and all(
                 np.isfinite(value) for value in row["metrics"].values()
@@ -254,6 +281,7 @@ def main() -> int:
         for row in report["rows"][1:]
         for name in modules
     )
+    input_encoder_hook.remove()
     atomic_json(output_path, report)
     return 0
 
