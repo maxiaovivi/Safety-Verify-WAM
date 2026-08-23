@@ -21,6 +21,21 @@ from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_no_grad_autocast_cache_does_not_hide_linear_gradients(self) -> None:
+        linear = torch.nn.Linear(4, 4)
+        inputs = torch.randn(2, 4)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            with torch.no_grad(), torch.autocast(
+                device_type="cpu",
+                dtype=torch.bfloat16,
+                cache_enabled=False,
+            ):
+                linear(inputs)
+            linear(inputs).float().square().mean().backward()
+
+        self.assertIsNotNone(linear.weight.grad)
+        self.assertGreater(float(linear.weight.grad.abs().sum()), 0.0)
+
     def test_compact_action_expert_backpropagates_to_encoder_and_ffn(self) -> None:
         config = OVCRSConfig(
             observation_dim=2,

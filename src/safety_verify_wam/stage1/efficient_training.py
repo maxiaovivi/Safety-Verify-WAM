@@ -273,7 +273,18 @@ class EfficientStudentTrainingAdapter(nn.Module):
                 batch["future_latent"] = video_latent
             else:
                 batch["video_latent"] = video_latent
-            outputs = self.efficient_model(batch)
+            # The shared action expert is used here under ``no_grad`` and then
+            # again by the trainable student in the caller's autocast region.
+            # Do not cache no-grad low-precision Linear weights: autocast would
+            # otherwise reuse detached casts and silently drop their gradients
+            # during the later student forward.
+            with torch.autocast(
+                device_type=torch.device(self.device_name).type,
+                dtype=self.efficient_model.compact_wan.video_model.precision,
+                enabled=torch.device(self.device_name).type == "cuda",
+                cache_enabled=False,
+            ):
+                outputs = self.efficient_model(batch)
             video_cache = outputs.get("video_cache")
             original_velocity = outputs.get("action_pred")
             if video_cache is None or original_velocity is None:
