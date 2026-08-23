@@ -226,7 +226,9 @@ class OVCRSEfficientWAMRunner(EfficientWAMRunner):
             profile_ms_sums,
             profile_calls,
         ) = self._finish_forward_timer(vgm_forward_timer)
-        actions = self.runtime.action_normalizer.denormalize(noisy_actions)
+        # RoboTwin converts the returned tensor to a NumPy array. NumPy has no
+        # bfloat16 dtype, so expose physical actions in float32 at this API edge.
+        actions = self.runtime.action_normalizer.denormalize(noisy_actions).float()
         predicted_video_has_condition_frame = not self.model.compact_wan.is_multiscale
         return (
             actions,
