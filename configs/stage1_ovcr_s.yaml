@@ -1,0 +1,35 @@
+student:
+  observation_dim: 48
+  query_dim: 512
+  num_queries: 32
+  video_dim: 2048
+  num_heads: 16
+  head_dim: 128
+  num_layers: 12
+  editor_rank: 256
+  action_dim: 14
+  action_hidden_dim: 768
+  action_ffn_dim: 3072
+  action_chunk_size: 16
+  num_registers: 4
+  time_embedding_dim: 256
+  num_train_timesteps: 1000
+  distill_layers: [3, 6, 9, 12]
+  gate_init: -4.0
+  eps: 1.0e-6
+
+teacher_distillation:
+  teacher_layer_mapping: [1, 2, 4, 6, 8, 11, 14, 17, 20, 23, 26, 30]
+  rollout_steps: 16
+  capture_steps: [0, 1, 2, 4, 8, 12, 16]
+  sigma_shift: null
+
+loss:
+  velocity_weight: 1.0
+  teacher_action_weight: 1.0
+  ground_truth_action_weight: 0.25
+  query_weight: 0.05
+  route_weight: 0.10
+  delta_weight: 0.10
+  response_weight: 0.25
+  eps: 1.0e-6
