@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-video-steps", type=int, default=2)
+    parser.add_argument(
+        "--action-noise-sampling",
+        choices=("aha_anchors", "uniform_shifted"),
+        default="aha_anchors",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +92,7 @@ def main() -> None:
         "num_video_frames": 8,
         "action_sigma_shift": 5.0,
         "video_sigma_shift": 5.0,
+        "action_noise_sampling": args.action_noise_sampling,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

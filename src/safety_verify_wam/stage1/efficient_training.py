@@ -53,6 +53,7 @@ class EfficientStudentTrainingAdapter(nn.Module):
         num_video_frames: int = 8,
         action_sigma_shift: float = 5.0,
         video_sigma_shift: float = 5.0,
+        action_noise_sampling: str = "aha_anchors",
     ) -> None:
         super().__init__()
         student_config = student.config
@@ -61,6 +62,11 @@ class EfficientStudentTrainingAdapter(nn.Module):
         self.student_dtype = student_dtype
         self.num_video_steps = int(num_video_steps)
         self.num_video_frames = int(num_video_frames)
+        self.action_noise_sampling = str(action_noise_sampling).strip().lower()
+        if self.action_noise_sampling not in {"aha_anchors", "uniform_shifted"}:
+            raise ValueError(
+                "action_noise_sampling must be 'aha_anchors' or 'uniform_shifted'"
+            )
         if self.num_video_steps <= 0:
             raise ValueError("num_video_steps must be positive")
         if self.num_video_frames <= 0 or self.num_video_frames % 4:
@@ -135,6 +141,10 @@ class EfficientStudentTrainingAdapter(nn.Module):
         self.action_scheduler = flow_scheduler(
             shift=float(action_sigma_shift), sigma_min=0.0, extra_one_step=True
         )
+        self.action_scheduler.set_timesteps(
+            num_inference_steps=self.student_config.num_train_timesteps,
+            training=True,
+        )
         self.normalizer = AHAEfficientNormalizerBridge.from_dataset_stats(
             aha_dataset_stats_path,
             efficient_dataset_stats_path,
@@ -169,6 +179,32 @@ class EfficientStudentTrainingAdapter(nn.Module):
             -1, video.shape[1], 1, video.shape[3], video.shape[4]
         )
         return torch.gather(video, dim=2, index=gather_index)
+
+    def _sample_action_noise_level(
+        self,
+        anchor_sigma: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.action_noise_sampling == "aha_anchors":
+            sigma = anchor_sigma.to(device=device, dtype=dtype).clamp(0, 1)
+            action_t = sigma * float(self.student_config.num_train_timesteps)
+            return sigma, action_t
+
+        timestep_id = torch.randint(
+            0,
+            self.student_config.num_train_timesteps,
+            (anchor_sigma.shape[0],),
+            device=device,
+        )
+        sigma = self.action_scheduler.sigmas.to(device=device, dtype=dtype)[
+            timestep_id
+        ]
+        action_t = self.action_scheduler.timesteps.to(device=device, dtype=dtype)[
+            timestep_id
+        ]
+        return sigma, action_t
 
     def _initialize_video_latent(
         self, current_frame: torch.Tensor
@@ -332,15 +368,17 @@ class EfficientStudentTrainingAdapter(nn.Module):
             device=target_device, dtype=target_dtype
         )
         initial_state = initial_state.to(device=target_device, dtype=target_dtype)
-        sigma = targets.sigma.to(device=target_device, dtype=target_dtype).clamp(0, 1)
+        sigma, action_t = self._sample_action_noise_level(
+            targets.sigma,
+            device=target_device,
+            dtype=target_dtype,
+        )
         noise = torch.randn_like(teacher_action)
         noisy_action = (
             teacher_action * (1 - sigma[:, None, None])
             + noise * sigma[:, None, None]
         )
         target_velocity = noise - teacher_action
-        action_t = sigma * float(self.student_config.num_train_timesteps)
-
         sample_action = sample.get("action")
         video = sample.get("video")
         context = sample.get("context")

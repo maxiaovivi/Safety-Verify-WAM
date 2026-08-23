@@ -320,6 +320,7 @@ class AHAOVCRSStage1Program(nn.Module):
         terms = {key: float(value.item()) for key, value in tensor_terms.items()}
         terms["mean_chunk_index"] = float(targets.chunk_index.float().mean().item())
         terms["mean_anchor_step"] = float(targets.anchor_step.float().mean().item())
+        terms["mean_action_sigma"] = float(targets.sigma.float().mean().item())
         return loss, terms
 
     def forward(

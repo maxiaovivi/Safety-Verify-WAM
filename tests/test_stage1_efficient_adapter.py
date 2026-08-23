@@ -16,11 +16,62 @@ from safety_verify_wam.stage1.efficient_adapter import (
     observation_tokens_from_condition_latent,
     share_efficient_action_expert,
 )
-from safety_verify_wam.stage1.efficient_training import _shared_batch_timestep
+from safety_verify_wam.stage1.efficient_training import (
+    EfficientStudentTrainingAdapter,
+    _shared_batch_timestep,
+)
 from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_uniform_shifted_noise_samples_full_scheduler_table(self) -> None:
+        adapter = EfficientStudentTrainingAdapter.__new__(
+            EfficientStudentTrainingAdapter
+        )
+        torch.nn.Module.__init__(adapter)
+        adapter.action_noise_sampling = "uniform_shifted"
+        adapter.student_config = OVCRSConfig(num_train_timesteps=4)
+        adapter.action_scheduler = type(
+            "Scheduler",
+            (),
+            {
+                "sigmas": torch.tensor([1.0, 0.8, 0.5, 0.1]),
+                "timesteps": torch.tensor([1000.0, 800.0, 500.0, 100.0]),
+            },
+        )()
+        torch.manual_seed(7)
+
+        sigma, action_t = adapter._sample_action_noise_level(
+            torch.zeros(64),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(tuple(sigma.shape), (64,))
+        self.assertTrue(torch.isin(sigma, adapter.action_scheduler.sigmas).all())
+        self.assertTrue(
+            torch.isin(action_t, adapter.action_scheduler.timesteps).all()
+        )
+        self.assertGreater(len(set(sigma.tolist())), 1)
+
+    def test_anchor_noise_sampling_preserves_teacher_sigma(self) -> None:
+        adapter = EfficientStudentTrainingAdapter.__new__(
+            EfficientStudentTrainingAdapter
+        )
+        torch.nn.Module.__init__(adapter)
+        adapter.action_noise_sampling = "aha_anchors"
+        adapter.student_config = OVCRSConfig(num_train_timesteps=1000)
+        anchor_sigma = torch.tensor([-0.1, 0.25, 1.1])
+
+        sigma, action_t = adapter._sample_action_noise_level(
+            anchor_sigma,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        torch.testing.assert_close(sigma, torch.tensor([0.0, 0.25, 1.0]))
+        torch.testing.assert_close(action_t, torch.tensor([0.0, 250.0, 1000.0]))
+
     def test_no_grad_autocast_cache_does_not_hide_linear_gradients(self) -> None:
         linear = torch.nn.Linear(4, 4)
         inputs = torch.randn(2, 4)
