@@ -125,6 +125,17 @@ def main() -> int:
     misc.register_work_dir(str(output_path.parent / ".optimizer-probe-work"))
     initialized = time.perf_counter()
     model = instantiate(cfg.model, model_dtype=torch.bfloat16, device="cuda:0")
+    efficient_adapter = model.efficient_training_adapter
+    shared_action_expert = bool(
+        efficient_adapter is not None
+        and efficient_adapter.efficient_model.action_expert
+        is model.student.action_expert
+    )
+    report["shared_action_expert"] = shared_action_expert
+    if efficient_adapter is not None and not shared_action_expert:
+        raise RuntimeError(
+            "Efficient-WAM and OVCR-S do not reference the same action expert"
+        )
     train_dataset, _ = build_datasets(cfg.data, cfg.model)
     subset = Subset(train_dataset, indices[:required_samples])
     loader = DataLoader(
