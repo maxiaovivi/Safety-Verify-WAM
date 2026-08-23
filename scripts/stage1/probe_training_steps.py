@@ -55,10 +55,13 @@ def module_grad_report(module: torch.nn.Module) -> dict[str, Any]:
     squared_norm = 0.0
     tensor_count = 0
     finite = True
-    for parameter in module.parameters():
+    parameter_norms: dict[str, float | None] = {}
+    for name, parameter in module.named_parameters():
         if parameter.grad is None:
+            parameter_norms[name] = None
             continue
         gradient = parameter.grad.detach().float()
+        parameter_norms[name] = float(gradient.norm().item())
         squared_norm += float(gradient.square().sum().item())
         tensor_count += 1
         finite = finite and bool(torch.isfinite(gradient).all().item())
@@ -67,6 +70,7 @@ def module_grad_report(module: torch.nn.Module) -> dict[str, Any]:
         "gradient_tensor_count": tensor_count,
         "finite": finite,
         "nonzero": squared_norm > 0.0,
+        "parameter_norms": parameter_norms,
     }
 
 
@@ -255,6 +259,11 @@ def main() -> int:
                             float(activation.grad.float().norm().item())
                             if activation.grad is not None
                             else 0.0
+                        ),
+                        "token_grad_norms": (
+                            activation.grad.float().norm(dim=-1).mean(dim=0).tolist()
+                            if activation.grad is not None
+                            else []
                         ),
                     }
                     for activation in input_encoder_activations
