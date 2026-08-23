@@ -70,6 +70,18 @@ def module_grad_report(module: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def module_parameter_report(module: torch.nn.Module) -> dict[str, int]:
+    parameters = list(module.parameters())
+    return {
+        "parameters": sum(parameter.numel() for parameter in parameters),
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in parameters if parameter.requires_grad
+        ),
+        "trainable_tensors": sum(parameter.requires_grad for parameter in parameters),
+        "parameter_tensors": len(parameters),
+    }
+
+
 def git_commit() -> str:
     root = Path(__file__).resolve().parents[2]
     return subprocess.check_output(
@@ -163,6 +175,14 @@ def main() -> int:
         "action_block_12": model.student.action_expert.blocks[11],
         "action_decoder": model.student.action_expert.decoder,
     }
+    report["module_parameters"] = {
+        name: module_parameter_report(module) for name, module in modules.items()
+    }
+    report["frozen_student_parameter_names"] = [
+        name
+        for name, parameter in model.student.named_parameters()
+        if not parameter.requires_grad
+    ]
     report["model_and_dataset_init_seconds"] = time.perf_counter() - initialized
     report["trainable_parameters"] = sum(parameter.numel() for parameter in parameters)
     report["student_parameter_dtypes"] = sorted(
