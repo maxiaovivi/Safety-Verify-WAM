@@ -21,6 +21,50 @@ from safety_verify_wam.stage1.ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 
 class EfficientAdapterTest(unittest.TestCase):
+    def test_compact_action_expert_backpropagates_to_encoder_and_ffn(self) -> None:
+        config = OVCRSConfig(
+            observation_dim=2,
+            query_dim=4,
+            num_queries=2,
+            video_dim=4,
+            num_heads=1,
+            head_dim=4,
+            num_layers=1,
+            editor_rank=2,
+            state_dim=2,
+            action_dim=2,
+            action_hidden_dim=4,
+            action_ffn_dim=8,
+            action_chunk_size=2,
+            num_registers=1,
+            time_embedding_dim=4,
+            distill_layers=(1,),
+        )
+        student = OVCRSActionGenerator(config)
+        torch.nn.init.normal_(student.action_expert.decoder.action_head[0].weight)
+        outputs = student(
+            noisy_action=torch.randn(2, 2, 2),
+            action_t=torch.tensor([250.0, 750.0]),
+            initial_state=torch.randn(2, 2),
+            observation_tokens=torch.randn(2, 3, 2),
+            video_kv_cache=(
+                {"k": torch.randn(2, 3, 4), "v": torch.randn(2, 3, 4)},
+            ),
+        )
+
+        outputs["action_velocity"].square().mean().backward()
+
+        encoder_grads = [
+            parameter.grad
+            for parameter in student.action_expert.input_encoder.parameters()
+        ]
+        ffn_grads = [
+            parameter.grad
+            for parameter in student.action_expert.blocks[0].ffn.parameters()
+        ]
+        self.assertTrue(any(grad is not None and grad.abs().sum() > 0 for grad in encoder_grads))
+        self.assertTrue(any(grad is not None and grad.abs().sum() > 0 for grad in ffn_grads))
+
     def test_efficient_runtime_and_student_share_one_action_expert(self) -> None:
         config = OVCRSConfig(
             observation_dim=2,
