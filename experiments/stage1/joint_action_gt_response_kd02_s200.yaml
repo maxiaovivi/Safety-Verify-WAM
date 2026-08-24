@@ -33,8 +33,9 @@ loss:
   response_weight: 0.2
 
 optimization:
-  batch_size: 32
-  gradient_accumulation_steps: 1
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  effective_batch_size: 32
   resume_from_global_step: 4000
   additional_steps: 200
   trainer_max_steps: 4200
@@ -46,6 +47,7 @@ optimization:
   student_parameter_dtype: float32
   max_grad_norm: 1.0
   seed: 42
+  resource_adaptation: Reduced per-device batch after a shared-GPU OOM; scientific targets and effective batch are unchanged.
 
 data:
   dataset: RoboTwin2.0
