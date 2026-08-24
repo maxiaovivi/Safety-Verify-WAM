@@ -1,0 +1,68 @@
+schema_version: 1
+experiment: joint-action-gt-response-kd02-s200
+purpose: Quickly test whether adapting the Efficient action expert to OVCR-edited K/V improves GT-action and closed-loop behavior.
+
+source:
+  shared_main_commit: f3feaf7
+  efficient_wam_commit: 2bd75a8c56acfcd5754b98c7ed313176911ccae0
+  aha_wam_commit: 471b9815738471d6e1758111b73a5198553c1817
+  initialization: response-KD step 4000 checkpoint
+
+model:
+  final_architecture: Efficient-sized OVCR-S student
+  target_source: ground_truth_with_aha_response
+  trainable_scope: query_encoder_cache_editor_and_action_expert
+  freeze_action_expert: false
+  action_flow_target: ground_truth
+  action_noise_sampling: uniform_shifted
+  num_train_timesteps: 1000
+  action_sigma_shift: 5.0
+  efficient_video_steps: 2
+  response_layers: [3, 6, 9, 12]
+  aha_layer_mapping: [4, 11, 20, 30]
+  response_projection_dim: 256
+
+loss:
+  velocity_weight: 1.0
+  teacher_action_weight: 0.0
+  ground_truth_action_weight: 0.0
+  preservation_weight: 0.0
+  query_weight: 0.0
+  route_weight: 0.0
+  delta_weight: 0.0
+  response_weight: 0.2
+
+optimization:
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  resume_from_global_step: 4000
+  additional_steps: 200
+  trainer_max_steps: 4200
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-3
+  adam_betas: [0.9, 0.95]
+  scheduler: constant
+  mixed_precision: bf16
+  student_parameter_dtype: float32
+  max_grad_norm: 1.0
+  seed: 42
+
+data:
+  dataset: RoboTwin2.0
+  train_windows_reported_by_loader: 6011575
+  validation_windows_reported_by_loader: 63528
+  sampled_train_windows: 6400
+  prompt_plan: deterministic seed-42 resume slice for global steps 4001 through 4200
+
+decision_gate:
+  compare_checkpoints: [step_004000.pt, step_004200.pt]
+  fixed_panel_metrics: [total_loss, response_loss, velocity_loss, ground_truth_action_loss]
+  task_eval: adjust_bottle demo_clean unseen seed42
+  extend_only_if: GT-action metrics or closed-loop behavior improve without numerical instability
+
+artifacts:
+  resolved_config: stage1_joint_action_gt_response_kd02_b32_s200_seed42.yaml
+  run_name: stage1-joint-action-gt-response-kd02-b32-s200-seed42
+  checkpoints: [step_004200.pt]
+  save_every_steps: 200
+  evaluate_every_steps: 200
