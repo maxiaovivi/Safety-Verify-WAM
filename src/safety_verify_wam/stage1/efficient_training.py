@@ -166,6 +166,12 @@ class EfficientStudentTrainingAdapter(nn.Module):
         self.efficient_model.eval()
         return self
 
+    @torch.no_grad()
+    def action_efficient_to_aha(self, action: torch.Tensor) -> torch.Tensor:
+        """Map the sampled Efficient-space action back to AHA coordinates."""
+
+        return self.normalizer.action_efficient_to_aha(action.float())
+
     def _select_chunk_frame(
         self,
         video: torch.Tensor,

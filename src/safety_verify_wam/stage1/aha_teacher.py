@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MethodType
 from typing import Any, Mapping, Sequence
 
@@ -32,6 +32,7 @@ class AHAOVCRSTeacherBatch:
     action_is_pad: torch.Tensor | None
     chunk_index: torch.Tensor
     anchor_step: torch.Tensor
+    response_context: Mapping[str, Any] | None = None
 
 
 def _evenly_spaced_indices(total: int, keep: int, device: torch.device) -> torch.Tensor:
@@ -91,6 +92,30 @@ def _gather_action_chunk(
         tensor.shape[0], tensor.shape[1] // chunk_size, chunk_size, *tensor.shape[2:]
     )
     return _gather_chunk_tokens(chunks, chunk_index)[:, 0]
+
+
+def _replace_action_chunk(
+    tensor: torch.Tensor,
+    replacement: torch.Tensor,
+    chunk_index: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    if tensor.ndim != 3 or tensor.shape[1] % chunk_size:
+        raise ValueError("Action tensor must be [B,T,D] with a divisible horizon")
+    expected = (tensor.shape[0], chunk_size, tensor.shape[2])
+    if tuple(replacement.shape) != expected:
+        raise ValueError(
+            "Replacement action chunk has the wrong shape: "
+            f"{tuple(replacement.shape)} vs {expected}"
+        )
+    chunks = tensor.reshape(
+        tensor.shape[0], tensor.shape[1] // chunk_size, chunk_size, tensor.shape[2]
+    )
+    scatter_index = chunk_index.view(-1, 1, 1, 1).expand(
+        -1, 1, chunk_size, tensor.shape[2]
+    )
+    updated = chunks.scatter(1, scatter_index, replacement.unsqueeze(1))
+    return updated.reshape_as(tensor)
 
 
 def _choose_chunk_indices(
@@ -291,6 +316,7 @@ class AHAOVCRTeacherAdapter(nn.Module):
         capture_steps: Sequence[int] = (0, 1, 2, 4, 8, 12, 16),
         sigma_shift: float | None = None,
         capture_structural_targets: bool = True,
+        capture_action_response_targets: bool = False,
     ) -> None:
         super().__init__()
         self.teacher = teacher
@@ -300,6 +326,16 @@ class AHAOVCRTeacherAdapter(nn.Module):
         self.capture_steps = tuple(sorted({int(step) for step in capture_steps}))
         self.sigma_shift = sigma_shift
         self.capture_structural_targets = bool(capture_structural_targets)
+        self.capture_action_response_targets = bool(capture_action_response_targets)
+        self.target_source = (
+            "ground_truth_with_aha_response"
+            if self.capture_action_response_targets
+            else "aha_teacher"
+        )
+        if self.capture_structural_targets and self.capture_action_response_targets:
+            raise ValueError(
+                "Structural and response-only AHA capture modes are mutually exclusive"
+            )
         if len(self.teacher_layer_mapping) != student_config.num_layers:
             raise ValueError(
                 "teacher_layer_mapping must contain one teacher layer per student layer"
@@ -665,6 +701,178 @@ class AHAOVCRTeacherAdapter(nn.Module):
         )
 
     @torch.no_grad()
+    def _prepare_response_only_batch(
+        self,
+        sample: dict[str, Any],
+        *,
+        tiled: bool,
+    ) -> AHAOVCRSTeacherBatch:
+        """Prepare GT chunks and retain only the frozen AHA response context."""
+
+        prepare_video_state = getattr(
+            self.raw_model, "_prepare_distill_video_state", None
+        )
+        if not callable(prepare_video_state):
+            raise TypeError(
+                "AHA teacher cannot prepare the video state required for response KD"
+            )
+        video_state = prepare_video_state(sample, tiled=tiled)
+        ground_truth_action = video_state.get("action")
+        if not isinstance(ground_truth_action, torch.Tensor):
+            raise RuntimeError("AHA video state did not contain a ground-truth action")
+        ground_truth_action = ground_truth_action.detach()
+        batch_size, action_horizon, action_dim = ground_truth_action.shape
+        chunk_size = self.student_config.action_chunk_size
+        if action_dim != self.student_config.action_dim:
+            raise ValueError(
+                f"AHA action dim {action_dim} differs from OVCR-S "
+                f"{self.student_config.action_dim}"
+            )
+        if action_horizon % chunk_size:
+            raise ValueError("AHA action horizon is not divisible by the student chunk size")
+        num_chunks = action_horizon // chunk_size
+        chunk_index = self._choose_chunk_indices(
+            sample,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            device=ground_truth_action.device,
+        )
+        ground_truth_chunk = _gather_action_chunk(
+            ground_truth_action, chunk_index, chunk_size
+        )
+
+        proprio = sample.get("proprio")
+        if not isinstance(proprio, torch.Tensor) or proprio.ndim != 3:
+            raise ValueError(
+                "sample['proprio'] must be [B,T,D] for Efficient action conditioning"
+            )
+        if (
+            proprio.shape[0] != batch_size
+            or proprio.shape[-1] != self.student_config.state_dim
+        ):
+            raise ValueError(
+                "sample proprio shape differs from the Efficient student state shape: "
+                f"{tuple(proprio.shape)}"
+            )
+        state_indices = (chunk_index * chunk_size).clamp_max(proprio.shape[1] - 1)
+        initial_state = torch.gather(
+            proprio.to(device=ground_truth_action.device),
+            dim=1,
+            index=state_indices.view(batch_size, 1, 1).expand(
+                -1, 1, self.student_config.state_dim
+            ),
+        )[:, 0]
+
+        action_is_pad = sample.get("action_is_pad")
+        if isinstance(action_is_pad, torch.Tensor) and tuple(
+            action_is_pad.shape[:2]
+        ) == (batch_size, action_horizon):
+            action_is_pad = _gather_action_chunk(
+                action_is_pad.to(device=ground_truth_action.device, dtype=torch.bool),
+                chunk_index,
+                chunk_size,
+            )
+        else:
+            action_is_pad = None
+
+        placeholder_observation = torch.zeros(
+            (batch_size, 1, self.student_config.observation_dim),
+            device=ground_truth_action.device,
+            dtype=ground_truth_action.dtype,
+        )
+        placeholder_queries = torch.zeros(
+            (batch_size, 1, self.student_config.num_queries, self.student_config.query_dim),
+            device=ground_truth_action.device,
+            dtype=ground_truth_action.dtype,
+        )
+        zeros = torch.zeros(
+            batch_size, device=ground_truth_action.device, dtype=ground_truth_action.dtype
+        )
+        return AHAOVCRSTeacherBatch(
+            noisy_action=ground_truth_chunk,
+            action_t=zeros,
+            sigma=zeros,
+            teacher_velocity=torch.zeros_like(ground_truth_chunk),
+            teacher_action=ground_truth_chunk,
+            ground_truth_action=ground_truth_chunk,
+            initial_state=initial_state,
+            reference_velocity=None,
+            observation_tokens=placeholder_observation,
+            observation_mask=torch.ones(
+                placeholder_observation.shape[:-1],
+                device=ground_truth_action.device,
+                dtype=torch.bool,
+            ),
+            video_kv_cache=tuple(),
+            teacher_queries=placeholder_queries,
+            teacher_editor_trace={},
+            teacher_action_responses={},
+            action_is_pad=action_is_pad,
+            chunk_index=chunk_index,
+            anchor_step=torch.zeros(
+                batch_size, device=ground_truth_action.device, dtype=torch.long
+            ),
+            response_context={"video_state": video_state},
+        )
+
+    @torch.no_grad()
+    def attach_action_response_targets(
+        self,
+        targets: AHAOVCRSTeacherBatch,
+        noisy_action: torch.Tensor,
+    ) -> AHAOVCRSTeacherBatch:
+        """Evaluate AHA responses at the student's sampled physical action state."""
+
+        context = targets.response_context
+        if not isinstance(context, Mapping):
+            raise ValueError("Response KD target batch has no retained AHA context")
+        video_state = context.get("video_state")
+        if not isinstance(video_state, dict):
+            raise ValueError("Response KD target batch has an invalid AHA video state")
+        ground_truth_action = video_state.get("action")
+        if not isinstance(ground_truth_action, torch.Tensor):
+            raise ValueError("AHA video state has no action tensor")
+        chunk_size = self.student_config.action_chunk_size
+        batch_size, action_horizon, _ = ground_truth_action.shape
+        if batch_size != targets.chunk_index.shape[0] or action_horizon % chunk_size:
+            raise ValueError("AHA response context and selected chunks are incompatible")
+        noisy_action = noisy_action.to(
+            device=ground_truth_action.device, dtype=ground_truth_action.dtype
+        )
+        noisy_action_full = _replace_action_chunk(
+            ground_truth_action.detach(),
+            noisy_action,
+            targets.chunk_index.to(device=ground_truth_action.device),
+            chunk_size,
+        )
+        num_chunks = action_horizon // chunk_size
+        selected_timestep = targets.action_t.to(
+            device=ground_truth_action.device, dtype=ground_truth_action.dtype
+        )
+        if selected_timestep.ndim == 2 and selected_timestep.shape[1] == 1:
+            selected_timestep = selected_timestep[:, 0]
+        if tuple(selected_timestep.shape) != (batch_size,):
+            raise ValueError("Selected action timestep must be [B] for response KD")
+        timestep_full = selected_timestep[:, None].expand(-1, num_chunks)
+        _, response_full = self._predict_velocity_with_response_trace(
+            noisy_action=noisy_action_full,
+            timestep_action=timestep_full,
+            video_state=video_state,
+        )
+        responses = {
+            layer: _gather_action_chunk(response, targets.chunk_index, chunk_size)
+            for layer, response in response_full.items()
+        }
+        missing = sorted(set(self.student_config.distill_layers) - set(responses))
+        if missing:
+            raise RuntimeError(f"AHA response trace missed mapped layers: {missing}")
+        return replace(
+            targets,
+            teacher_action_responses=responses,
+            response_context=None,
+        )
+
+    @torch.no_grad()
     def _predict_velocity_with_response_trace(
         self,
         *,
@@ -741,6 +949,8 @@ class AHAOVCRTeacherAdapter(nn.Module):
     ) -> AHAOVCRSTeacherBatch:
         self.teacher.eval()
         if not self.capture_structural_targets:
+            if self.capture_action_response_targets:
+                return self._prepare_response_only_batch(sample, tiled=tiled)
             return self._prepare_action_only_batch(sample, tiled=tiled)
         rollout, captured = self._rollout_with_ovcr_trace(sample, tiled)
         video_state = rollout["video_state"]

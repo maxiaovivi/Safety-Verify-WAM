@@ -49,6 +49,7 @@ class Stage1LossConfig:
     route_weight: float = 0.10
     delta_weight: float = 0.10
     response_weight: float = 0.25
+    response_projection_dim: int | None = None
     eps: float = 1.0e-6
 
     def __post_init__(self) -> None:
@@ -66,6 +67,8 @@ class Stage1LossConfig:
             raise ValueError("Stage 1 loss weights must be non-negative")
         if not any(weight > 0 for weight in weights):
             raise ValueError("At least one Stage 1 loss term must be enabled")
+        if self.response_projection_dim is not None and self.response_projection_dim <= 0:
+            raise ValueError("response_projection_dim must be positive when set")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -215,14 +218,24 @@ def stage1_distillation_loss(
     response_losses: list[torch.Tensor] = []
     if config.response_weight > 0:
         student_responses = outputs.get("action_responses", {})
+        if not targets.teacher_action_responses:
+            raise ValueError(
+                "response_weight is enabled but no AHA action responses were provided"
+            )
         for layer, teacher_response in targets.teacher_action_responses.items():
             if layer not in student_responses:
                 raise ValueError(
                     f"Student did not return action response for layer {layer}"
                 )
-            response_losses.append(
-                _cosine_loss(student_responses[layer], teacher_response)
-            )
+            student_response = student_responses[layer]
+            if config.response_projection_dim is not None:
+                student_response = _resize_last_dimension(
+                    student_response, config.response_projection_dim
+                )
+                teacher_response = _resize_last_dimension(
+                    teacher_response, config.response_projection_dim
+                )
+            response_losses.append(_cosine_loss(student_response, teacher_response))
     response_loss = torch.stack(response_losses).mean() if response_losses else zero
 
     total = (
@@ -336,6 +349,21 @@ class AHAOVCRSStage1Program(nn.Module):
             if not callable(prepare_batch):
                 raise TypeError("Efficient training adapter has no prepare_batch method")
             targets = prepare_batch(sample, targets)
+        if self.loss_config.response_weight > 0 and not targets.teacher_action_responses:
+            if self.efficient_training_adapter is None:
+                raise ValueError("AHA response targets were not prepared")
+            convert_action = getattr(
+                self.efficient_training_adapter, "action_efficient_to_aha", None
+            )
+            attach_responses = getattr(
+                self.teacher_adapter, "attach_action_response_targets", None
+            )
+            if not callable(convert_action) or not callable(attach_responses):
+                raise TypeError(
+                    "Efficient/AHA adapters do not support matched response targets"
+                )
+            noisy_action_aha = convert_action(targets.noisy_action)
+            targets = attach_responses(targets, noisy_action_aha)
         needs_editor_trace = (
             self.loss_config.route_weight > 0
             or self.loss_config.delta_weight > 0
@@ -517,7 +545,6 @@ def create_aha_ovcr_s_stage1(
             "query_weight": resolved_loss_config.query_weight,
             "route_weight": resolved_loss_config.route_weight,
             "delta_weight": resolved_loss_config.delta_weight,
-            "response_weight": resolved_loss_config.response_weight,
         }
         enabled_structural = {
             name: weight for name, weight in structural_weights.items() if weight > 0
@@ -527,6 +554,23 @@ def create_aha_ovcr_s_stage1(
                 "AHA structural losses cannot supervise Efficient-generated K/V; "
                 f"set these weights to zero: {enabled_structural}"
             )
+        if resolved_loss_config.response_weight > 0:
+            conditioning = dict(efficient_conditioning)
+            if conditioning.get("action_flow_target") != "ground_truth":
+                raise ValueError(
+                    "AHA response KD with Efficient K/V requires "
+                    "action_flow_target='ground_truth'"
+                )
+            if conditioning.get("action_noise_sampling") != "uniform_shifted":
+                raise ValueError(
+                    "AHA response KD with Efficient K/V requires "
+                    "action_noise_sampling='uniform_shifted'"
+                )
+            if resolved_loss_config.teacher_action_weight > 0:
+                raise ValueError(
+                    "AHA response KD with Efficient K/V requires "
+                    "teacher_action_weight=0"
+                )
         from .efficient_training import EfficientStudentTrainingAdapter
 
         efficient_training_adapter = EfficientStudentTrainingAdapter(
@@ -548,6 +592,10 @@ def create_aha_ovcr_s_stage1(
         capture_steps=capture_steps,
         sigma_shift=sigma_shift,
         capture_structural_targets=efficient_training_adapter is None,
+        capture_action_response_targets=(
+            efficient_training_adapter is not None
+            and resolved_loss_config.response_weight > 0
+        ),
     )
     teacher_model = adapter.raw_model
     compatibility_values = {
