@@ -15,7 +15,7 @@ from .models.safety_verifier import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:

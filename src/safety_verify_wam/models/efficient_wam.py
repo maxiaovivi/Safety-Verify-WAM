@@ -85,8 +85,9 @@ class EfficientWAMSafetyBackbone(nn.Module):
 
     The external model remains unmodified. Current robot state, candidate
     actions, and task text enter the same state/action and video paths used by
-    the original Efficient-WAM checkpoint. Only the action decoder is replaced
-    by a three-class safety head.
+    the original Efficient-WAM checkpoint. The candidate action is clamped at
+    the clean flow endpoint while video latents are denoised. Late frozen
+    ActionExpert streams are exposed to a low-rank three-class safety reader.
     """
 
     def __init__(
@@ -99,6 +100,7 @@ class EfficientWAMSafetyBackbone(nn.Module):
         flow_shift: float,
         rollout_seed: int,
         randomize_training_noise: bool,
+        safety_tap_layers: int,
     ) -> None:
         super().__init__()
         self.wam = wam
@@ -108,7 +110,7 @@ class EfficientWAMSafetyBackbone(nn.Module):
         self.flow_shift = float(flow_shift)
         self.rollout_seed = int(rollout_seed)
         self.randomize_training_noise = bool(randomize_training_noise)
-        self.video_dim = int(wam.config.compact_wan.dim)
+        self.safety_tap_layers = int(safety_tap_layers)
         self.action_feature_dim = int(wam.config.ae_dim)
         self.action_dim = int(wam.config.action_dim)
         self.action_steps = int(wam.config.chunk_size)
@@ -122,55 +124,33 @@ class EfficientWAMSafetyBackbone(nn.Module):
             raise ValueError("rollout_steps must be at least 1")
         if self.num_video_frames < 4 or self.num_video_frames % 4 != 0:
             raise ValueError("num_video_frames must be a positive multiple of 4")
+        if not 1 <= self.safety_tap_layers <= int(wam.config.ae_num_layers):
+            raise ValueError(
+                "safety_tap_layers must be in [1, Efficient-WAM action layers]"
+            )
         self.wam.configure_teacache(enabled=False)
 
     def train(self, mode: bool = True) -> "EfficientWAMSafetyBackbone":
         super().train(mode)
-        # Efficient-WAM has no safety-specific running statistics. Keeping it in
-        # eval mode makes rollout repeatable while still allowing parameter grads.
+        # Efficient-WAM is a frozen feature generator. Keep its stochastic/stateful
+        # behavior in evaluation mode while the low-rank safety reader trains.
         self.wam.eval()
         return self
 
-    def configure_trainability(self, mode: str, last_joint_layers: int = 2) -> None:
+    def configure_trainability(self, mode: str) -> None:
         for parameter in self.wam.parameters():
             parameter.requires_grad_(False)
         mode = str(mode)
-        count = max(1, int(last_joint_layers))
-        if mode == "head_only":
-            pass
-        elif mode == "action_last":
-            encoder = self.wam.action_expert.input_encoder
-            for parameter in encoder.parameters():
-                parameter.requires_grad_(True)
-            for block in self.wam.action_expert.blocks[-count:]:
-                for parameter in block.parameters():
-                    parameter.requires_grad_(True)
-        elif mode == "joint_last":
-            encoder = self.wam.action_expert.input_encoder
-            for parameter in encoder.parameters():
-                parameter.requires_grad_(True)
-            for block in self.wam.action_expert.blocks[-count:]:
-                for parameter in block.parameters():
-                    parameter.requires_grad_(True)
-            video_blocks = self.wam.compact_wan.video_model.wan_model.blocks
-            for block in video_blocks[-count:]:
-                for parameter in block.parameters():
-                    parameter.requires_grad_(True)
-        elif mode == "all_except_vae":
-            for parameter in self.wam.parameters():
-                parameter.requires_grad_(True)
-        else:
+        if mode != "head_only":
             raise ValueError(
-                f"Unsupported backbone.train_mode={mode!r}; expected head_only, "
-                "action_last, joint_last, or all_except_vae"
+                "Safety-LoRA keeps the complete Efficient-WAM frozen; "
+                f"backbone.train_mode must be 'head_only', got {mode!r}"
             )
         vae = getattr(self.wam.compact_wan.video_model, "vae", None)
         if vae is not None and hasattr(vae, "parameters"):
             for parameter in vae.parameters():
                 parameter.requires_grad_(False)
-        self._has_trainable_wam_parameters = any(
-            parameter.requires_grad for parameter in self.wam.parameters()
-        )
+        self._has_trainable_wam_parameters = False
         self.wam.eval()
 
     def _encode_state_and_actions(
@@ -251,6 +231,8 @@ class EfficientWAMSafetyBackbone(nn.Module):
             action_t, action_tokens.shape[1]
         )
 
+        action_feature_taps: list[torch.Tensor] = []
+        first_tap_layer = int(wam.config.ae_num_layers) - self.safety_tap_layers
         for layer_idx in range(wam.config.ae_num_layers):
             wan_layer = wam.compact_wan.video_model.wan_model.blocks[layer_idx]
             action_block = wam.action_expert.blocks[layer_idx]
@@ -308,28 +290,33 @@ class EfficientWAMSafetyBackbone(nn.Module):
                 action_tokens = (
                     action_tokens + action_ffn * action_modulation[5].squeeze(2)
                 )
+            if return_features and layer_idx >= first_tap_layer:
+                action_feature_taps.append(action_tokens)
 
-        outputs: dict[str, torch.Tensor] = {
-            "video_pred": wam.compact_wan.apply_multiscale_video_head(
-                video_tokens, video_head_time_emb, layout
-            )
-        }
-        if return_features:
-            condition_len = int(layout["condition_seq_len"])
-            condition_tokens = video_tokens[:, :condition_len]
-            future_tokens = video_tokens[:, condition_len:]
-            expected_future_tokens = int(layout["future_seq_len"])
-            if future_tokens.shape[1] != expected_future_tokens:
-                raise RuntimeError(
-                    "Future token layout mismatch: "
-                    f"{future_tokens.shape[1]} != {expected_future_tokens}"
+        if not return_features:
+            return {
+                "video_pred": wam.compact_wan.apply_multiscale_video_head(
+                    video_tokens, video_head_time_emb, layout
                 )
-            action_steps = int(action.shape[1])
-            outputs["condition_features"] = condition_tokens
-            outputs["future_features"] = future_tokens
-            outputs["state_features"] = action_tokens[:, :1]
-            outputs["action_features"] = action_tokens[:, 1 : 1 + action_steps]
-        return outputs
+            }
+
+        if len(action_feature_taps) != self.safety_tap_layers:
+            raise RuntimeError(
+                "Efficient-WAM returned an incomplete set of safety taps: "
+                f"{len(action_feature_taps)} != {self.safety_tap_layers}"
+            )
+        action_steps = int(action.shape[1])
+        register_start = 1 + action_steps
+        tapped_tokens = torch.stack(action_feature_taps, dim=1)
+        if tapped_tokens.shape[2] < register_start:
+            raise RuntimeError(
+                "ActionExpert token sequence is shorter than state + action chunk"
+            )
+        return {
+            "state_feature_taps": tapped_tokens[:, :, :1],
+            "action_feature_taps": tapped_tokens[:, :, 1:register_start],
+            "register_feature_taps": tapped_tokens[:, :, register_start:],
+        }
 
     def _make_future_noise(
         self,
@@ -429,10 +416,9 @@ class EfficientWAMSafetyBackbone(nn.Module):
                 return_features=True,
             )
         return {
-            "condition_features": features["condition_features"],
-            "future_features": features["future_features"],
-            "state_features": features["state_features"],
-            "action_features": features["action_features"],
+            "state_feature_taps": features["state_feature_taps"],
+            "action_feature_taps": features["action_feature_taps"],
+            "register_feature_taps": features["register_feature_taps"],
         }
 
 
@@ -514,6 +500,8 @@ def build_model(config: dict[str, Any], device: str | torch.device | None = None
     wam.to(selected_device)
     wam.eval()
 
+    head_meta = config.get("model", {})
+    num_taps = int(head_meta.get("num_taps", 2))
     adapter = EfficientWAMSafetyBackbone(
         wam,
         modules["FlowMatchScheduler"],
@@ -524,18 +512,14 @@ def build_model(config: dict[str, Any], device: str | torch.device | None = None
         randomize_training_noise=bool(
             backbone_config.get("randomize_training_noise", True)
         ),
+        safety_tap_layers=num_taps,
     )
-    adapter.configure_trainability(
-        str(backbone_config.get("train_mode", "head_only")),
-        int(backbone_config.get("train_last_joint_layers", 2)),
-    )
-    head_meta = config.get("model", {})
+    adapter.configure_trainability(str(backbone_config.get("train_mode", "head_only")))
     head_config = RiskHeadConfig(
-        video_dim=adapter.video_dim,
         action_dim=adapter.action_feature_dim,
-        hidden_dim=int(head_meta.get("hidden_dim", 512)),
-        num_heads=int(head_meta.get("num_heads", 8)),
-        num_layers=int(head_meta.get("num_layers", 2)),
+        rank=int(head_meta.get("rank", 16)),
+        alpha=float(head_meta.get("alpha", 16.0)),
+        num_taps=num_taps,
         dropout=float(head_meta.get("dropout", 0.1)),
         max_action_steps=int(head_meta.get("max_action_steps", adapter.action_steps)),
         num_risk_types=int(head_meta.get("num_risk_types", 0)),

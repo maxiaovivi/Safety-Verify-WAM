@@ -12,23 +12,26 @@ SAFETY_CLASS_NAMES = ("safe", "boundary", "risk")
 
 @dataclass(frozen=True)
 class RiskHeadConfig:
-    video_dim: int
     action_dim: int
-    hidden_dim: int = 512
-    num_heads: int = 8
-    num_layers: int = 2
+    rank: int = 16
+    alpha: float = 16.0
+    num_taps: int = 2
     dropout: float = 0.1
     max_action_steps: int = 16
     num_risk_types: int = 0
     class_names: tuple[str, str, str] = SAFETY_CLASS_NAMES
 
     def __post_init__(self) -> None:
-        if self.hidden_dim % self.num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-        if self.video_dim <= 0 or self.action_dim <= 0:
-            raise ValueError("Feature dimensions must be positive")
-        if self.num_layers < 1:
-            raise ValueError("num_layers must be at least 1")
+        if self.action_dim <= 0:
+            raise ValueError("action_dim must be positive")
+        if self.rank < 1 or self.rank > self.action_dim:
+            raise ValueError("rank must be in [1, action_dim]")
+        if self.alpha <= 0:
+            raise ValueError("alpha must be positive")
+        if self.num_taps < 1:
+            raise ValueError("num_taps must be at least 1")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         if self.max_action_steps < 1:
             raise ValueError("max_action_steps must be at least 1")
         if tuple(self.class_names) != SAFETY_CLASS_NAMES:
@@ -40,90 +43,67 @@ class RiskHeadConfig:
         return asdict(self)
 
 
-class _ActionQueriesToVideoBlock(nn.Module):
-    """Let state/action queries read Efficient-WAM condition and future tokens."""
+class _LowRankResidualAdapter(nn.Module):
+    """Read a frozen ActionExpert residual stream through a low-rank delta."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        dim: int,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> None:
         super().__init__()
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.video_norm = nn.LayerNorm(hidden_dim)
-        self.cross_attention = nn.MultiheadAttention(
-            hidden_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.Dropout(dropout),
-        )
+        self.norm = nn.LayerNorm(dim)
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.up = nn.Linear(rank, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = float(alpha) / float(rank)
+        self.reset_parameters()
 
-    def forward(self, queries: torch.Tensor, video: torch.Tensor) -> torch.Tensor:
-        normalized_video = self.video_norm(video)
-        attended, _ = self.cross_attention(
-            self.query_norm(queries),
-            normalized_video,
-            normalized_video,
-            need_weights=False,
-        )
-        queries = queries + attended
-        return queries + self.ffn(self.ffn_norm(queries))
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.down.weight, a=5**0.5)
+        # A zero output projection makes the initial adapter an identity map.
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        delta = self.up(self.down(self.norm(tokens))) * self.scale
+        return tokens + self.dropout(delta)
 
 
 class SafetyRiskHead(nn.Module):
-    """Classify a candidate action by querying Efficient-WAM visual dynamics.
+    """Decode risk from frozen, future-conditioned ActionExpert tokens.
 
-    Efficient-WAM first produces condition/future video tokens and aligned
-    state/action tokens. This head keeps the spatial video tokens intact,
-    treats the state and candidate-action features as queries, and predicts the
-    mutually exclusive classes ``safe``, ``boundary``, and ``risk``.
+    Efficient-WAM has already let action queries attend video keys and values
+    in every joint block. The head therefore reads late state/action/register
+    residual streams directly. Each tapped layer receives only a low-rank
+    residual delta; the original Efficient-WAM parameters and imagined future
+    remain unchanged.
     """
 
     def __init__(self, config: RiskHeadConfig) -> None:
         super().__init__()
         self.config = config
-        self.video_norm = nn.LayerNorm(config.video_dim)
-        self.state_norm = nn.LayerNorm(config.action_dim)
-        self.action_norm = nn.LayerNorm(config.action_dim)
-        self.video_projection = nn.Linear(config.video_dim, config.hidden_dim)
-        self.state_projection = nn.Linear(config.action_dim, config.hidden_dim)
-        self.action_projection = nn.Linear(config.action_dim, config.hidden_dim)
-
-        # condition, future, state, and action token identities
-        self.token_types = nn.Embedding(4, config.hidden_dim)
-        self.action_positions = nn.Parameter(
-            torch.empty(1, config.max_action_steps, config.hidden_dim)
-        )
-        self.query_blocks = nn.ModuleList(
+        self.tap_adapters = nn.ModuleList(
             [
-                _ActionQueriesToVideoBlock(
-                    config.hidden_dim,
-                    config.num_heads,
+                _LowRankResidualAdapter(
+                    config.action_dim,
+                    config.rank,
+                    config.alpha,
                     config.dropout,
                 )
-                for _ in range(config.num_layers)
+                for _ in range(config.num_taps)
             ]
         )
-
-        self.chunk_query = nn.Parameter(torch.empty(1, 1, config.hidden_dim))
-        self.chunk_query_norm = nn.LayerNorm(config.hidden_dim)
-        self.chunk_memory_norm = nn.LayerNorm(config.hidden_dim)
-        self.chunk_attention = nn.MultiheadAttention(
-            config.hidden_dim,
-            config.num_heads,
-            dropout=config.dropout,
-            batch_first=True,
-        )
-        self.chunk_output_norm = nn.LayerNorm(config.hidden_dim)
-        self.step_output_norm = nn.LayerNorm(config.hidden_dim)
-        self.chunk_head = nn.Linear(config.hidden_dim, len(config.class_names))
-        self.step_head = nn.Linear(config.hidden_dim, len(config.class_names))
+        self.tap_logits = nn.Parameter(torch.zeros(config.num_taps))
+        self.pool_norm = nn.LayerNorm(config.action_dim)
+        self.pool_score = nn.Linear(config.action_dim, 1, bias=False)
+        self.chunk_output_norm = nn.LayerNorm(config.action_dim)
+        self.step_output_norm = nn.LayerNorm(config.action_dim)
+        self.chunk_head = nn.Linear(config.action_dim, len(config.class_names))
+        self.step_head = nn.Linear(config.action_dim, len(config.class_names))
         self.type_head = (
-            nn.Linear(config.hidden_dim, config.num_risk_types)
+            nn.Linear(config.action_dim, config.num_risk_types)
             if config.num_risk_types > 0
             else None
         )
@@ -135,8 +115,8 @@ class SafetyRiskHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.normal_(self.action_positions, std=0.02)
-        nn.init.normal_(self.chunk_query, std=0.02)
+        nn.init.zeros_(self.tap_logits)
+        nn.init.xavier_uniform_(self.pool_score.weight)
         nn.init.xavier_uniform_(self.chunk_head.weight)
         nn.init.zeros_(self.chunk_head.bias)
         nn.init.xavier_uniform_(self.step_head.weight)
@@ -145,87 +125,85 @@ class SafetyRiskHead(nn.Module):
             nn.init.xavier_uniform_(self.type_head.weight)
             nn.init.zeros_(self.type_head.bias)
 
-    @staticmethod
-    def _validate_feature(
+    def _validate_taps(
+        self,
         name: str,
         value: torch.Tensor,
         *,
         batch_size: int | None = None,
     ) -> None:
-        if value.ndim != 3:
-            raise ValueError(f"{name} must be [B,T,D], got {tuple(value.shape)}")
+        if value.ndim != 4:
+            raise ValueError(f"{name} must be [B,K,T,D], got {tuple(value.shape)}")
+        if value.shape[1] != self.config.num_taps:
+            raise ValueError(
+                f"{name} has {value.shape[1]} taps, expected {self.config.num_taps}"
+            )
+        if value.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                f"{name} feature dim is {value.shape[-1]}, "
+                f"expected {self.config.action_dim}"
+            )
         if batch_size is not None and value.shape[0] != batch_size:
             raise ValueError(f"{name} batch size differs from the other features")
 
     def forward(
         self,
-        condition_features: torch.Tensor,
-        future_features: torch.Tensor,
-        state_features: torch.Tensor,
-        action_features: torch.Tensor,
+        state_feature_taps: torch.Tensor,
+        action_feature_taps: torch.Tensor,
+        register_feature_taps: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        self._validate_feature("condition_features", condition_features)
-        batch = int(condition_features.shape[0])
-        self._validate_feature("future_features", future_features, batch_size=batch)
-        self._validate_feature("state_features", state_features, batch_size=batch)
-        self._validate_feature("action_features", action_features, batch_size=batch)
-        if state_features.shape[1] != 1:
-            raise ValueError("state_features must contain exactly one current-state token")
-        action_steps = int(action_features.shape[1])
+        self._validate_taps("state_feature_taps", state_feature_taps)
+        batch = int(state_feature_taps.shape[0])
+        self._validate_taps(
+            "action_feature_taps", action_feature_taps, batch_size=batch
+        )
+        self._validate_taps(
+            "register_feature_taps", register_feature_taps, batch_size=batch
+        )
+        if state_feature_taps.shape[2] != 1:
+            raise ValueError("state_feature_taps must contain one state token per tap")
+        action_steps = int(action_feature_taps.shape[2])
         if action_steps > self.config.max_action_steps:
             raise ValueError(
                 f"Action feature length {action_steps} exceeds "
                 f"{self.config.max_action_steps}"
             )
 
-        device = condition_features.device
-        video_dtype = self.video_projection.weight.dtype
-        action_dtype = self.action_projection.weight.dtype
-        condition = self.video_projection(
-            self.video_norm(condition_features.to(dtype=video_dtype))
+        adapter_dtype = self.tap_adapters[0].down.weight.dtype
+        joint_taps = torch.cat(
+            [state_feature_taps, action_feature_taps, register_feature_taps],
+            dim=2,
+        ).to(dtype=adapter_dtype)
+        adapted_taps = torch.stack(
+            [
+                adapter(joint_taps[:, tap_index])
+                for tap_index, adapter in enumerate(self.tap_adapters)
+            ],
+            dim=1,
         )
-        future = self.video_projection(
-            self.video_norm(future_features.to(dtype=video_dtype))
+        tap_weights = torch.softmax(self.tap_logits.float(), dim=0).to(
+            dtype=adapted_taps.dtype
         )
-        condition = condition + self.token_types(
-            torch.tensor(0, device=device)
-        ).view(1, 1, -1)
-        future = future + self.token_types(torch.tensor(1, device=device)).view(
-            1, 1, -1
+        joint_tokens = torch.sum(
+            adapted_taps * tap_weights.view(1, -1, 1, 1),
+            dim=1,
         )
-        video = torch.cat([condition, future], dim=1)
 
-        state = self.state_projection(
-            self.state_norm(state_features.to(dtype=action_dtype))
+        action_tokens = joint_tokens[:, 1 : 1 + action_steps]
+        pool_logits = self.pool_score(self.pool_norm(joint_tokens)).squeeze(-1)
+        pool_weights = torch.softmax(pool_logits.float(), dim=1).to(
+            dtype=joint_tokens.dtype
         )
-        action = self.action_projection(
-            self.action_norm(action_features.to(dtype=action_dtype))
-        )
-        state = state + self.token_types(torch.tensor(2, device=device)).view(
-            1, 1, -1
-        )
-        action = (
-            action
-            + self.action_positions[:, :action_steps]
-            + self.token_types(torch.tensor(3, device=device)).view(1, 1, -1)
-        )
-        queries = torch.cat([state, action], dim=1)
-        for block in self.query_blocks:
-            queries = block(queries, video)
-
-        chunk_query = self.chunk_query.expand(batch, -1, -1)
-        chunk_memory = self.chunk_memory_norm(queries)
-        pooled, _ = self.chunk_attention(
-            self.chunk_query_norm(chunk_query),
-            chunk_memory,
-            chunk_memory,
-            need_weights=False,
-        )
-        chunk_feature = self.chunk_output_norm(chunk_query + pooled)[:, 0]
-        action_consequences = self.step_output_norm(queries[:, 1:])
+        chunk_feature = torch.sum(joint_tokens * pool_weights.unsqueeze(-1), dim=1)
+        chunk_feature = self.chunk_output_norm(chunk_feature)
+        step_features = self.step_output_norm(action_tokens)
         outputs = {
             "class_logits": self.chunk_head(chunk_feature),
-            "step_class_logits": self.step_head(action_consequences),
+            "step_class_logits": self.step_head(step_features),
+            "risk_features": chunk_feature,
+            "step_risk_features": step_features,
+            "safety_pool_weights": pool_weights,
+            "safety_tap_weights": tap_weights,
         }
         if self.type_head is not None:
             outputs["risk_type_logits"] = self.type_head(chunk_feature)
@@ -266,10 +244,9 @@ class SafetyVerifyWAM(nn.Module):
             text_embeddings,
         )
         outputs = self.risk_head(
-            features["condition_features"],
-            features["future_features"],
-            features["state_features"],
-            features["action_features"],
+            features["state_feature_taps"],
+            features["action_feature_taps"],
+            features["register_feature_taps"],
         )
         probabilities = torch.softmax(outputs["class_logits"].float(), dim=-1)
         outputs["class_probabilities"] = probabilities

@@ -28,12 +28,11 @@ backbone:
   rollout_seed: 17
   randomize_training_noise: true
   train_mode: head_only
-  train_last_joint_layers: 2
 
 model:
-  hidden_dim: 512
-  num_heads: 8
-  num_layers: 2
+  rank: 16
+  alpha: 16.0
+  num_taps: 2
   dropout: 0.1
   max_action_steps: 16
   num_risk_types: 0
