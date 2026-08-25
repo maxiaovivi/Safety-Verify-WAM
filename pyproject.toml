@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "safety-verify-wam"
 version = "0.1.0"
-description = "Image-action risk verification with Efficient-WAM future latent imagination"
+description = "Three-class action safety verification on Efficient-WAM future representations"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [

@@ -8,7 +8,9 @@ dataset:
   train_manifest: manifests/train.jsonl
   image_size: [384, 320]
   image_size_policy: error
+  state_shape: [14]
   action_shape: [16, 14]
+  text_embedding_dim: 4096
   require_normalized_actions: true
   normalized_action_limit: 1.05
   num_workers: 4
@@ -21,7 +23,7 @@ backbone:
   vae_path: /path/to/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
   precision: bfloat16
   num_video_frames: 8
-  rollout_steps: 4
+  rollout_steps: 2
   flow_shift: 5.0
   rollout_seed: 17
   randomize_training_noise: true
@@ -33,16 +35,14 @@ model:
   num_heads: 8
   num_layers: 2
   dropout: 0.1
-  max_future_steps: 8
   max_action_steps: 16
   num_risk_types: 0
-  unsafe_threshold: 0.5
 
 loss:
   chunk_weight: 1.0
   step_weight: 0.0
   type_weight: 0.0
-  positive_weight: null
+  class_weights: null
 
 training:
   epochs: 20

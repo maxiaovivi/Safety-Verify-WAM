@@ -12,7 +12,8 @@ from torch.utils.data import Dataset
 from ..config import resolve_project_path
 
 
-MODEL_INPUT_KEYS = ("image", "action")
+MODEL_INPUT_KEYS = ("image", "state", "action", "text_embeddings")
+RISK_CLASS_TO_INDEX = {"safe": 0, "boundary": 1, "risk": 2}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -68,19 +69,31 @@ def load_image_tensor(
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
-def load_action_tensor(value: Any, root: Path) -> torch.Tensor:
+def _load_numeric_tensor(value: Any, root: Path, field_name: str) -> torch.Tensor:
     if isinstance(value, str):
-        action_path = _resolve_data_path(root, value, "action_path")
-        if action_path.suffix.lower() != ".npy":
-            raise ValueError(f"Action files must use .npy: {action_path}")
-        array = np.load(action_path, allow_pickle=False)
+        array_path = _resolve_data_path(root, value, field_name)
+        if array_path.suffix.lower() != ".npy":
+            raise ValueError(f"{field_name} files must use .npy: {array_path}")
+        array = np.load(array_path, allow_pickle=False)
     elif isinstance(value, list):
         array = np.asarray(value, dtype=np.float32)
     else:
-        raise TypeError("Each record needs action_path or an inline action array")
+        raise TypeError(f"Each record needs {field_name} or an inline numeric array")
     if not np.issubdtype(array.dtype, np.number):
-        raise TypeError("Action array must be numeric")
+        raise TypeError(f"{field_name} array must be numeric")
     return torch.from_numpy(np.asarray(array, dtype=np.float32).copy())
+
+
+def load_action_tensor(value: Any, root: Path) -> torch.Tensor:
+    return _load_numeric_tensor(value, root, "action_path")
+
+
+def load_state_tensor(value: Any, root: Path) -> torch.Tensor:
+    return _load_numeric_tensor(value, root, "state_path")
+
+
+def load_text_embedding_tensor(value: Any, root: Path) -> torch.Tensor:
+    return _load_numeric_tensor(value, root, "text_embedding_path")
 
 
 def validate_action_tensor(
@@ -101,8 +114,59 @@ def validate_action_tensor(
         )
 
 
+def validate_state_tensor(
+    state: torch.Tensor,
+    state_shape: Sequence[int],
+    require_normalized: bool,
+    normalized_limit: float,
+) -> None:
+    expected = tuple(int(value) for value in state_shape)
+    if tuple(state.shape) != expected:
+        raise ValueError(f"State has shape {tuple(state.shape)}, expected {expected}")
+    if not torch.isfinite(state).all():
+        raise ValueError("State contains NaN or infinity")
+    if require_normalized and state.abs().max().item() > float(normalized_limit):
+        raise ValueError(
+            f"Normalized state exceeds ±{normalized_limit}; normalize with the same "
+            "statistics used by the Efficient-WAM checkpoint"
+        )
+
+
+def validate_text_embedding_tensor(
+    text_embeddings: torch.Tensor,
+    embedding_dim: int,
+) -> None:
+    if text_embeddings.ndim != 2 or text_embeddings.shape[-1] != int(embedding_dim):
+        raise ValueError(
+            f"Text embedding must be [L,{embedding_dim}], "
+            f"got {tuple(text_embeddings.shape)}"
+        )
+    if text_embeddings.shape[0] < 1:
+        raise ValueError("Text embedding sequence cannot be empty")
+    if not torch.isfinite(text_embeddings).all():
+        raise ValueError("Text embedding contains NaN or infinity")
+
+
+def parse_risk_class(value: Any) -> int:
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key not in RISK_CLASS_TO_INDEX:
+            raise ValueError(
+                f"Unknown risk class {value!r}; expected one of "
+                f"{tuple(RISK_CLASS_TO_INDEX)}"
+            )
+        return RISK_CLASS_TO_INDEX[key]
+    if (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and float(value).is_integer()
+        and int(value) in {0, 1, 2}
+    ):
+        return int(value)
+    raise ValueError("risk must be safe/boundary/risk or integer 0/1/2")
+
+
 class SafetyManifestDataset(Dataset[dict[str, Any]]):
-    """JSONL-backed safety dataset with explicit image/action model inputs."""
+    """JSONL safety data matching the original Efficient-WAM conditions."""
 
     def __init__(
         self,
@@ -110,7 +174,9 @@ class SafetyManifestDataset(Dataset[dict[str, Any]]):
         manifest: str | Path,
         image_size: Sequence[int] = (384, 320),
         image_size_policy: str = "error",
+        state_shape: Sequence[int] = (14,),
         action_shape: Sequence[int] = (16, 14),
+        text_embedding_dim: int = 4096,
         require_normalized_actions: bool = True,
         normalized_action_limit: float = 1.05,
     ) -> None:
@@ -126,7 +192,9 @@ class SafetyManifestDataset(Dataset[dict[str, Any]]):
         self.records = _read_jsonl(self.manifest_path)
         self.image_size = tuple(int(value) for value in image_size)
         self.image_size_policy = str(image_size_policy)
+        self.state_shape = tuple(int(value) for value in state_shape)
         self.action_shape = tuple(int(value) for value in action_shape)
+        self.text_embedding_dim = int(text_embedding_dim)
         self.require_normalized_actions = bool(require_normalized_actions)
         self.normalized_action_limit = float(normalized_action_limit)
 
@@ -140,7 +208,9 @@ class SafetyManifestDataset(Dataset[dict[str, Any]]):
             manifest=dataset_config[f"{split}_manifest"],
             image_size=dataset_config.get("image_size", (384, 320)),
             image_size_policy=dataset_config.get("image_size_policy", "error"),
+            state_shape=dataset_config.get("state_shape", (14,)),
             action_shape=dataset_config.get("action_shape", (16, 14)),
+            text_embedding_dim=int(dataset_config.get("text_embedding_dim", 4096)),
             require_normalized_actions=dataset_config.get("require_normalized_actions", True),
             normalized_action_limit=dataset_config.get("normalized_action_limit", 1.05),
         )
@@ -154,33 +224,50 @@ class SafetyManifestDataset(Dataset[dict[str, Any]]):
         sample_id = str(record.get("sample_id", f"line-{line}"))
         try:
             image_path = _resolve_data_path(self.root, str(record["image_path"]), "image_path")
+            state_value = record.get("state_path", record.get("state"))
             action_value = record.get("action_path", record.get("action"))
+            text_value = record.get(
+                "text_embedding_path", record.get("text_embeddings")
+            )
             image = load_image_tensor(image_path, self.image_size, self.image_size_policy)
+            state = load_state_tensor(state_value, self.root)
             action = load_action_tensor(action_value, self.root)
+            text_embeddings = load_text_embedding_tensor(text_value, self.root)
+            validate_state_tensor(
+                state,
+                self.state_shape,
+                self.require_normalized_actions,
+                self.normalized_action_limit,
+            )
             validate_action_tensor(
                 action,
                 self.action_shape,
                 self.require_normalized_actions,
                 self.normalized_action_limit,
             )
-            risk = float(record["risk"])
-            if risk not in {0.0, 1.0}:
-                raise ValueError(f"risk must be 0 or 1, got {risk!r}")
+            validate_text_embedding_tensor(
+                text_embeddings,
+                self.text_embedding_dim,
+            )
+            risk = parse_risk_class(record["risk"])
             item: dict[str, Any] = {
                 "sample_id": sample_id,
                 "image": image,
+                "state": state,
                 "action": action,
-                "risk": torch.tensor([risk], dtype=torch.float32),
+                "text_embeddings": text_embeddings,
+                "risk": torch.tensor(risk, dtype=torch.long),
             }
             if "risk_steps" in record:
-                risk_steps = torch.as_tensor(record["risk_steps"], dtype=torch.float32)
+                risk_steps = torch.tensor(
+                    [parse_risk_class(value) for value in record["risk_steps"]],
+                    dtype=torch.long,
+                )
                 if tuple(risk_steps.shape) != (self.action_shape[0],):
                     raise ValueError(
                         f"risk_steps has shape {tuple(risk_steps.shape)}, "
                         f"expected {(self.action_shape[0],)}"
                     )
-                if not torch.all((risk_steps == 0) | (risk_steps == 1)):
-                    raise ValueError("risk_steps values must be 0 or 1")
                 item["risk_steps"] = risk_steps
             if "risk_type" in record:
                 item["risk_type"] = int(record["risk_type"])
@@ -197,14 +284,22 @@ def safety_collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
     batch: dict[str, Any] = {
         "sample_id": [item["sample_id"] for item in items],
         "image": torch.stack([item["image"] for item in items]),
+        "state": torch.stack([item["state"] for item in items]),
         "action": torch.stack([item["action"] for item in items]),
+        "text_embeddings": [item["text_embeddings"] for item in items],
         "risk": torch.stack([item["risk"] for item in items]),
     }
     action_steps = int(items[0]["action"].shape[0])
     step_available = torch.tensor(["risk_steps" in item for item in items], dtype=torch.bool)
     batch["risk_steps_available"] = step_available
     batch["risk_steps"] = torch.stack(
-        [item.get("risk_steps", torch.zeros(action_steps, dtype=torch.float32)) for item in items]
+        [
+            item.get(
+                "risk_steps",
+                torch.full((action_steps,), -100, dtype=torch.long),
+            )
+            for item in items
+        ]
     )
     batch["risk_type"] = torch.tensor(
         [int(item.get("risk_type", -100)) for item in items], dtype=torch.long
@@ -212,10 +307,20 @@ def safety_collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
     return batch
 
 
-def model_inputs_from_batch(batch: dict[str, Any], device: torch.device | str) -> dict[str, torch.Tensor]:
+def model_inputs_from_batch(
+    batch: dict[str, Any],
+    device: torch.device | str,
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """The only transfer point from dataset records into the network."""
 
-    return {key: batch[key].to(device, non_blocking=True) for key in MODEL_INPUT_KEYS}
+    return {
+        "image": batch["image"].to(device, non_blocking=True),
+        "state": batch["state"].to(device, non_blocking=True),
+        "action": batch["action"].to(device, non_blocking=True),
+        "text_embeddings": [
+            item.to(device, non_blocking=True) for item in batch["text_embeddings"]
+        ],
+    }
 
 
 def iter_manifest_errors(dataset: SafetyManifestDataset) -> Iterable[str]:

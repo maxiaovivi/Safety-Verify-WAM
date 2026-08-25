@@ -1,3 +1,13 @@
-from .safety_verifier import RiskHeadConfig, SafetyRiskHead, SafetyVerifyWAM
+from .safety_verifier import (
+    SAFETY_CLASS_NAMES,
+    RiskHeadConfig,
+    SafetyRiskHead,
+    SafetyVerifyWAM,
+)
 
-__all__ = ["RiskHeadConfig", "SafetyRiskHead", "SafetyVerifyWAM"]
+__all__ = [
+    "SAFETY_CLASS_NAMES",
+    "RiskHeadConfig",
+    "SafetyRiskHead",
+    "SafetyVerifyWAM",
+]

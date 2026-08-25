@@ -6,7 +6,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -81,11 +81,12 @@ def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tens
 
 
 class EfficientWAMSafetyBackbone(nn.Module):
-    """Pinned Efficient-WAM adapter for action-conditioned future imagination.
+    """Pinned Efficient-WAM adapter for candidate-conditioned imagination.
 
-    The external model remains unmodified. This adapter reuses its action MLP,
-    joint attention blocks, video head, and VAE while removing sample-level
-    robot state and task text from the safety network interface.
+    The external model remains unmodified. Current robot state, candidate
+    actions, and task text enter the same state/action and video paths used by
+    the original Efficient-WAM checkpoint. Only the action decoder is replaced
+    by a three-class safety head.
     """
 
     def __init__(
@@ -138,14 +139,14 @@ class EfficientWAMSafetyBackbone(nn.Module):
         if mode == "head_only":
             pass
         elif mode == "action_last":
-            encoder = self.wam.action_expert.input_encoder.action_encoder
+            encoder = self.wam.action_expert.input_encoder
             for parameter in encoder.parameters():
                 parameter.requires_grad_(True)
             for block in self.wam.action_expert.blocks[-count:]:
                 for parameter in block.parameters():
                     parameter.requires_grad_(True)
         elif mode == "joint_last":
-            encoder = self.wam.action_expert.input_encoder.action_encoder
+            encoder = self.wam.action_expert.input_encoder
             for parameter in encoder.parameters():
                 parameter.requires_grad_(True)
             for block in self.wam.action_expert.blocks[-count:]:
@@ -172,44 +173,56 @@ class EfficientWAMSafetyBackbone(nn.Module):
         )
         self.wam.eval()
 
-    def _encode_actions_only(
+    def _encode_state_and_actions(
         self,
+        state: torch.Tensor,
         action: torch.Tensor,
         registers: torch.Tensor | None,
     ) -> torch.Tensor:
         encoder = self.wam.action_expert.input_encoder
-        if not hasattr(encoder, "action_encoder") or not hasattr(encoder, "pos_embedding"):
-            raise RuntimeError("Pinned Efficient-WAM action encoder interface changed")
-        encoded_action = encoder.action_encoder(action)
-        action_steps = int(encoded_action.shape[1])
-        action_positions = encoder.pos_embedding[:, 1 : 1 + action_steps]
-        action_positions = action_positions.to(
-            device=encoded_action.device, dtype=encoded_action.dtype
-        )
-        encoded_action = encoded_action + action_positions
-        if registers is None:
-            return encoded_action
-        register_steps = int(registers.shape[1])
-        register_start = 1 + action_steps
-        register_positions = encoder.pos_embedding[
-            :, register_start : register_start + register_steps
-        ].to(device=registers.device, dtype=registers.dtype)
-        return torch.cat([encoded_action, registers + register_positions], dim=1)
+        if not hasattr(encoder, "state_encoder") or not hasattr(
+            encoder, "action_encoder"
+        ):
+            raise RuntimeError("Pinned Efficient-WAM state/action encoder changed")
+        return encoder(state.unsqueeze(1), action, registers)
 
-    def _null_text_embeddings(
+    def _prepare_text_embeddings(
         self,
+        text_embeddings: torch.Tensor | Sequence[torch.Tensor],
         batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
     ) -> list[torch.Tensor]:
         text_dim = int(self.wam.compact_wan.video_model.wan_model.text_dim)
-        return [torch.zeros((1, text_dim), device=device, dtype=dtype) for _ in range(batch_size)]
+        if isinstance(text_embeddings, torch.Tensor):
+            if text_embeddings.ndim == 2 and batch_size == 1:
+                items = [text_embeddings]
+            elif text_embeddings.ndim == 3 and text_embeddings.shape[0] == batch_size:
+                items = list(text_embeddings.unbind(0))
+            else:
+                raise ValueError(
+                    "text_embeddings must be [B,L,D], or [L,D] for batch size 1"
+                )
+        else:
+            items = list(text_embeddings)
+        if len(items) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} text embeddings, received {len(items)}"
+            )
+        for item in items:
+            if item.ndim != 2 or item.shape[-1] != text_dim:
+                raise ValueError(
+                    f"Each text embedding must be [L,{text_dim}], got {tuple(item.shape)}"
+                )
+            if not torch.isfinite(item).all():
+                raise ValueError("Text embedding contains NaN or infinity")
+        return items
 
     def _joint_forward(
         self,
         condition_latent: torch.Tensor,
         future_latent: torch.Tensor,
+        state: torch.Tensor,
         action: torch.Tensor,
+        text_embeddings: torch.Tensor | Sequence[torch.Tensor],
         video_t: torch.Tensor,
         *,
         return_features: bool,
@@ -218,10 +231,11 @@ class EfficientWAMSafetyBackbone(nn.Module):
         video_tokens, seq_lens, layout, freqs = wam.compact_wan.prepare_multiscale_video_tokens(
             condition_latent, future_latent
         )
-        text_embeddings = self._null_text_embeddings(
-            action.shape[0], video_tokens.device, video_tokens.dtype
+        text_batch = self._prepare_text_embeddings(
+            text_embeddings,
+            int(action.shape[0]),
         )
-        text_context = wam.compact_wan.prepare_text_context(text_embeddings)
+        text_context = wam.compact_wan.prepare_text_context(text_batch)
         video_head_time_emb, video_adaln_params = wam._build_video_time_embeddings(
             video_t, video_tokens.shape[1]
         )
@@ -229,7 +243,7 @@ class EfficientWAMSafetyBackbone(nn.Module):
         registers = None
         if wam.action_expert.config.num_registers > 0 and wam.action_expert.registers is not None:
             registers = wam.action_expert.registers.expand(action.shape[0], -1, -1)
-        action_tokens = self._encode_actions_only(action, registers)
+        action_tokens = self._encode_state_and_actions(state, action, registers)
         action_t = torch.zeros(
             action.shape[0], device=action.device, dtype=action.dtype
         )
@@ -302,19 +316,19 @@ class EfficientWAMSafetyBackbone(nn.Module):
         }
         if return_features:
             condition_len = int(layout["condition_seq_len"])
-            future_shape = tuple(int(value) for value in layout["future_grid_shape"])
-            future_steps, future_h, future_w = future_shape
+            condition_tokens = video_tokens[:, :condition_len]
             future_tokens = video_tokens[:, condition_len:]
-            expected_tokens = future_steps * future_h * future_w
-            if future_tokens.shape[1] != expected_tokens:
+            expected_future_tokens = int(layout["future_seq_len"])
+            if future_tokens.shape[1] != expected_future_tokens:
                 raise RuntimeError(
-                    f"Future token layout mismatch: {future_tokens.shape[1]} != {expected_tokens}"
+                    "Future token layout mismatch: "
+                    f"{future_tokens.shape[1]} != {expected_future_tokens}"
                 )
-            future_features = future_tokens.reshape(
-                future_tokens.shape[0], future_steps, future_h * future_w, future_tokens.shape[-1]
-            ).mean(dim=2)
-            outputs["future_features"] = future_features
-            outputs["action_features"] = action_tokens[:, : action.shape[1]]
+            action_steps = int(action.shape[1])
+            outputs["condition_features"] = condition_tokens
+            outputs["future_features"] = future_tokens
+            outputs["state_features"] = action_tokens[:, :1]
+            outputs["action_features"] = action_tokens[:, 1 : 1 + action_steps]
         return outputs
 
     def _make_future_noise(
@@ -347,17 +361,31 @@ class EfficientWAMSafetyBackbone(nn.Module):
             generator=generator,
         )
 
-    def imagine(self, image: torch.Tensor, action: torch.Tensor) -> dict[str, torch.Tensor]:
+    def imagine(
+        self,
+        image: torch.Tensor,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        text_embeddings: torch.Tensor | Sequence[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if state.shape[1:] != (self.wam.config.state_dim,):
+            raise ValueError(
+                f"Expected state [B,{self.wam.config.state_dim}], "
+                f"got {tuple(state.shape)}"
+            )
         if action.shape[1:] != (self.action_steps, self.action_dim):
             raise ValueError(
                 f"Expected action [B, {self.action_steps}, {self.action_dim}], "
                 f"got {tuple(action.shape)}"
             )
+        if state.shape[0] != action.shape[0] or image.shape[0] != action.shape[0]:
+            raise ValueError("Image, state, and action batch sizes differ")
         model_parameter = next(self.wam.parameters())
         device = model_parameter.device
         video_dtype = self.wam.compact_wan.video_model.precision
         action_dtype = next(self.wam.action_expert.parameters()).dtype
         image = image.to(device=device, dtype=video_dtype)
+        state = state.to(device=device, dtype=action_dtype)
         action = action.to(device=device, dtype=action_dtype)
         if image.min().item() < -1e-6 or image.max().item() > 1.0 + 1e-6:
             raise ValueError("Input images must be scaled to [0, 1]")
@@ -378,7 +406,9 @@ class EfficientWAMSafetyBackbone(nn.Module):
                 velocity = self._joint_forward(
                     condition_latent,
                     future_latent,
+                    state,
                     action,
+                    text_embeddings,
                     current_t,
                     return_features=False,
                 )["video_pred"]
@@ -392,12 +422,16 @@ class EfficientWAMSafetyBackbone(nn.Module):
             features = self._joint_forward(
                 condition_latent,
                 future_latent.detach(),
+                state,
                 action,
+                text_embeddings,
                 final_t,
                 return_features=True,
             )
         return {
+            "condition_features": features["condition_features"],
             "future_features": features["future_features"],
+            "state_features": features["state_features"],
             "action_features": features["action_features"],
         }
 
@@ -503,10 +537,8 @@ def build_model(config: dict[str, Any], device: str | torch.device | None = None
         num_heads=int(head_meta.get("num_heads", 8)),
         num_layers=int(head_meta.get("num_layers", 2)),
         dropout=float(head_meta.get("dropout", 0.1)),
-        max_future_steps=int(head_meta.get("max_future_steps", 8)),
         max_action_steps=int(head_meta.get("max_action_steps", adapter.action_steps)),
         num_risk_types=int(head_meta.get("num_risk_types", 0)),
-        unsafe_threshold=float(head_meta.get("unsafe_threshold", 0.5)),
     )
     model = SafetyVerifyWAM(adapter, SafetyRiskHead(head_config)).to(selected_device)
     return model

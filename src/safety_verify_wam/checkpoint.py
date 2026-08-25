@@ -15,7 +15,7 @@ from .models.safety_verifier import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
@@ -67,15 +67,7 @@ def save_checkpoint(
 def restore_model(model: SafetyVerifyWAM, payload: dict[str, Any]) -> None:
     expected = model.risk_head.config.to_dict()
     actual = payload.get("risk_head_config")
-    expected_architecture = {
-        key: value for key, value in expected.items() if key != "unsafe_threshold"
-    }
-    actual_architecture = (
-        {key: value for key, value in actual.items() if key != "unsafe_threshold"}
-        if isinstance(actual, dict)
-        else actual
-    )
-    if actual_architecture != expected_architecture:
+    if actual != expected:
         raise RuntimeError(
             f"Risk head configuration mismatch: expected {expected}, checkpoint has {actual}"
         )
@@ -91,9 +83,6 @@ def inference_config(
     merged = dict(trained)
     merged["device"] = runtime_config.get("device", trained.get("device", "cuda"))
     merged["model"] = dict(trained.get("model", {}))
-    runtime_model = runtime_config.get("model", {})
-    if "unsafe_threshold" in runtime_model:
-        merged["model"]["unsafe_threshold"] = runtime_model["unsafe_threshold"]
     merged_backbone = dict(trained.get("backbone", {}))
     for key in ("source_root", "base_checkpoint", "wan_root", "vae_path", "precision"):
         if key in runtime_config.get("backbone", {}):
