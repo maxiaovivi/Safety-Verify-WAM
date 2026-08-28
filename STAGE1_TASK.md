@@ -71,6 +71,8 @@ task T5 tokens + current proprio token               | residual
 必须全部通过：
 
 - 单元测试确认动作 token 数恰好为 16，cross-attention、RoPE、状态和文本路径存在；
+- 根据确定性 sampler、验证抽样与 DataLoader 预取范围生成精确 prompt 清单，清单内缓存必须 100% 存在；
+- 训练与验证均使用 `FailFastRobotVideoDataset`，任何缺缓存或损坏样本直接终止，不允许随机换样本；
 - AHA structured slice 初始化覆盖 action expert 的每个 tensor；
 - 旧 checkpoint 的 conditioning-only 加载没有形状冲突；
 - 一个真实 batch 前向、反向和 optimizer step 都为有限值；

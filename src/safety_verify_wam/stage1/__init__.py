@@ -4,6 +4,7 @@ from .aha_teacher import (
     GroundTruthTargetAdapter,
 )
 from .aha_current_training import AHACurrentKVTrainingAdapter
+from .dataset import FailFastRobotVideoDataset
 from .distill import (
     AHAOVCRSStage1Program,
     Stage1LossConfig,
@@ -18,6 +19,7 @@ __all__ = [
     "AHACurrentKVTrainingAdapter",
     "AHAOVCRSStage1Program",
     "AHAOVCRTeacherAdapter",
+    "FailFastRobotVideoDataset",
     "GroundTruthTargetAdapter",
     "OVCRSActionGenerator",
     "OVCRSConfig",
