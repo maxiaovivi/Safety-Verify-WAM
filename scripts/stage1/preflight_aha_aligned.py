@@ -426,7 +426,11 @@ def run_preflight(args: argparse.Namespace, report: dict[str, Any]) -> None:
         and isinstance(targets.action_context_mask, torch.Tensor)
         and noise_formula_error <= 2e-2
         and flow_reconstruction_error <= 2e-2
-        and timestep_error <= 1.0
+        # BF16 stores the shifted [0, 1000] timestep at roughly 2-4 point
+        # intervals in the upper range. This tolerance only covers that
+        # representational rounding; the sigma/noise identities are checked
+        # independently above.
+        and timestep_error <= 4.0
         and state_alignment_error <= 1e-6
         and state_sensitivity > 0.0
         and context_sensitivity > 0.0
