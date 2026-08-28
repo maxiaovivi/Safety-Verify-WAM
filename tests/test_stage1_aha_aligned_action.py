@@ -3,12 +3,14 @@ from __future__ import annotations
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from safety_verify_wam.stage1.ovcr_s import (
     AHAAlignedActionExpert,
     OVCRSActionGenerator,
     OVCRSConfig,
     _apply_rotary_embedding,
+    sinusoidal_embedding_1d,
 )
 
 
@@ -36,6 +38,116 @@ def _tiny_config(*, architecture: str, num_registers: int) -> OVCRSConfig:
 
 
 class AHAAlignedActionTest(unittest.TestCase):
+    def test_aligned_action_matches_the_released_aha_block_order(self) -> None:
+        config = _tiny_config(architecture="aha_aligned", num_registers=0)
+        student = OVCRSActionGenerator(config).eval()
+        noisy_action = torch.randn(1, 2, 2)
+        action_t = torch.tensor([375.0])
+        initial_state = torch.randn(1, 2)
+        task_context = torch.randn(1, 3, 6)
+        task_mask = torch.tensor([[True, True, False]])
+        observation = torch.randn(1, 3, 2)
+        cache = ({"k": torch.randn(1, 3, 4), "v": torch.randn(1, 3, 4)},)
+        conditioning = student.prepare_conditioning(observation, cache)
+
+        actual = student.predict_velocity(
+            noisy_action,
+            action_t,
+            initial_state,
+            conditioning,
+            action_context=task_context,
+            action_context_mask=task_mask,
+        )["action_velocity"]
+
+        expert = student.action_expert
+        self.assertIsInstance(expert, AHAAlignedActionExpert)
+        tokens = expert.action_encoder(noisy_action)
+        tokens = tokens + student.action_branch_embedding[1].view(1, 1, -1)
+        proprio = student.proprio_encoder(initial_state).unsqueeze(1)
+        context = expert.text_embedding(torch.cat([task_context, proprio], dim=1))
+        context_mask = torch.cat(
+            [task_mask, torch.ones(1, 1, dtype=torch.bool)], dim=1
+        )
+        timestep = action_t[:, None].expand(-1, noisy_action.shape[1])
+        time_embedding = expert.time_embedding(
+            sinusoidal_embedding_1d(config.time_embedding_dim, timestep)
+        )
+        time_modulation = expert.time_projection(time_embedding).view(
+            1, noisy_action.shape[1], 6, config.action_hidden_dim
+        )
+
+        block = expert.blocks[0]
+        modulation = (
+            block.modulation.unsqueeze(0) + time_modulation
+        ).chunk(6, dim=2)
+        shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = [
+            value.squeeze(2) for value in modulation
+        ]
+        normalized = block.norm1(tokens) * (1 + scale_attn) + shift_attn
+        query = block.self_attn.norm_q(block.self_attn.q(normalized)).view(
+            1, 2, config.num_heads, config.head_dim
+        )
+        action_key = block.self_attn.norm_k(block.self_attn.k(normalized)).view_as(
+            query
+        )
+        action_value = block.self_attn.v(normalized).view_as(query)
+
+        def released_aha_rope(value: torch.Tensor) -> torch.Tensor:
+            positions = torch.arange(value.shape[1], dtype=torch.float64)
+            frequencies = 1.0 / (
+                10000
+                ** (
+                    torch.arange(0, value.shape[-1], 2, dtype=torch.float64)
+                    / value.shape[-1]
+                )
+            )
+            angles = torch.outer(positions, frequencies)
+            pairs = value.float().reshape(*value.shape[:-1], -1, 2)
+            first, second = pairs.unbind(-1)
+            rotated = torch.stack(
+                [
+                    first * angles.cos()[None, :, None]
+                    - second * angles.sin()[None, :, None],
+                    first * angles.sin()[None, :, None]
+                    + second * angles.cos()[None, :, None],
+                ],
+                dim=-1,
+            )
+            return rotated.flatten(-2).to(value.dtype)
+
+        query = released_aha_rope(query)
+        action_key = released_aha_rope(action_key)
+        updated = conditioning["updated_cache"][0]
+        video_key = updated["k"][:, 0].view(1, -1, 1, 4)
+        video_value = updated["v"][:, 0].view_as(video_key)
+        mixed = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            torch.cat([video_key, action_key], dim=1).transpose(1, 2),
+            torch.cat([video_value, action_value], dim=1).transpose(1, 2),
+        ).transpose(1, 2)
+        tokens = tokens + block.self_attn.o(mixed.flatten(2)) * gate_attn
+
+        cross_input = block.norm3(tokens)
+        cross_query = block.cross_attn.norm_q(
+            block.cross_attn.q(cross_input)
+        ).view(1, 2, 1, 4)
+        cross_key = block.cross_attn.norm_k(block.cross_attn.k(context)).view(
+            1, 4, 1, 4
+        )
+        cross_value = block.cross_attn.v(context).view(1, 4, 1, 4)
+        cross_response = F.scaled_dot_product_attention(
+            cross_query.transpose(1, 2),
+            cross_key.transpose(1, 2),
+            cross_value.transpose(1, 2),
+            attn_mask=context_mask[:, None, None, :],
+        ).transpose(1, 2)
+        tokens = tokens + block.cross_attn.o(cross_response.flatten(2))
+        ffn_input = block.norm2(tokens) * (1 + scale_ffn) + shift_ffn
+        tokens = tokens + block.ffn(ffn_input) * gate_ffn
+        expected = expert.head(tokens)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
     def test_aligned_structure_has_exact_action_tokens_and_context_gradients(self) -> None:
         config = _tiny_config(architecture="aha_aligned", num_registers=0)
         student = OVCRSActionGenerator(config)
