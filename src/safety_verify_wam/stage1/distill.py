@@ -431,7 +431,7 @@ class AHAOVCRSStage1Program(nn.Module):
             "step": step,
         }
         if self.efficient_training_adapter is not None:
-            payload["efficient_training"] = {
+            training_metadata = {
                 "action_noise_sampling": getattr(
                     self.efficient_training_adapter,
                     "action_noise_sampling",
@@ -444,6 +444,14 @@ class AHAOVCRSStage1Program(nn.Module):
                 ),
                 "freeze_action_expert": self._freeze_action_expert,
             }
+            if (
+                getattr(self.efficient_training_adapter, "conditioning_source", None)
+                == "aha_current_kv"
+            ):
+                payload["target_source"] = "ground_truth_with_aha_current_kv"
+                payload["aha_current_training"] = training_metadata
+            else:
+                payload["efficient_training"] = training_metadata
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, checkpoint_path)
@@ -500,6 +508,7 @@ def create_aha_ovcr_s_stage1(
     num_history_frames: int | None = None,
     efficient_action_checkpoint: str | Path | None = None,
     strict_action_init: bool = True,
+    aha_current_conditioning: Mapping[str, Any] | None = None,
     efficient_conditioning: Mapping[str, Any] | None = None,
     student_parameter_dtype: str | torch.dtype | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -539,7 +548,23 @@ def create_aha_ovcr_s_stage1(
         fallback=model_dtype,
     )
     student.to(device=torch.device(device), dtype=resolved_parameter_dtype)
+    if aha_current_conditioning is not None and efficient_conditioning is not None:
+        raise ValueError(
+            "aha_current_conditioning and efficient_conditioning are mutually exclusive"
+        )
     efficient_training_adapter: nn.Module | None = None
+    using_aha_current_conditioning = aha_current_conditioning is not None
+    if aha_current_conditioning is not None:
+        if resolved_loss_config.response_weight > 0:
+            raise ValueError(
+                "AHA current-KV response KD is not enabled in the GT-flow stage"
+            )
+        from .aha_current_training import AHACurrentKVTrainingAdapter
+
+        efficient_training_adapter = AHACurrentKVTrainingAdapter(
+            student=student,
+            **dict(aha_current_conditioning),
+        )
     if efficient_conditioning is not None:
         structural_weights = {
             "query_weight": resolved_loss_config.query_weight,
@@ -591,7 +616,9 @@ def create_aha_ovcr_s_stage1(
         rollout_steps=rollout_steps,
         capture_steps=capture_steps,
         sigma_shift=sigma_shift,
-        capture_structural_targets=efficient_training_adapter is None,
+        capture_structural_targets=(
+            efficient_training_adapter is None or using_aha_current_conditioning
+        ),
         capture_action_response_targets=(
             efficient_training_adapter is not None
             and resolved_loss_config.response_weight > 0

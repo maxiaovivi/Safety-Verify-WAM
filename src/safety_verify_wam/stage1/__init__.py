@@ -3,6 +3,7 @@ from .aha_teacher import (
     AHAOVCRTeacherAdapter,
     GroundTruthTargetAdapter,
 )
+from .aha_current_training import AHACurrentKVTrainingAdapter
 from .distill import (
     AHAOVCRSStage1Program,
     Stage1LossConfig,
@@ -14,6 +15,7 @@ from .ovcr_s import OVCRSActionGenerator, OVCRSConfig
 
 __all__ = [
     "AHAOVCRSTeacherBatch",
+    "AHACurrentKVTrainingAdapter",
     "AHAOVCRSStage1Program",
     "AHAOVCRTeacherAdapter",
     "GroundTruthTargetAdapter",

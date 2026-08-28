@@ -11,6 +11,9 @@ from safety_verify_wam.stage1.aha_teacher import (
     AHAOVCRTeacherAdapter,
     GroundTruthTargetAdapter,
 )
+from safety_verify_wam.stage1.aha_current_training import (
+    AHACurrentKVTrainingAdapter,
+)
 from safety_verify_wam.stage1.distill import (
     AHAOVCRSStage1Program,
     Stage1LossConfig,
@@ -100,6 +103,63 @@ class Stage1DistillationLossTest(unittest.TestCase):
                     "action_offset": torch.zeros(1, dtype=torch.long),
                 }
             )
+
+    def test_aha_current_kv_adapter_uses_shifted_ground_truth_flow(self) -> None:
+        config = self._tiny_config()
+        student = OVCRSActionGenerator(config)
+        adapter = AHACurrentKVTrainingAdapter(
+            student=student,
+            action_sigma_shift=5.0,
+            freeze_action_expert=True,
+        )
+        ground_truth = torch.tensor([[[1.0, -1.0], [0.5, -0.5]]])
+        targets = AHAOVCRSTeacherBatch(
+            noisy_action=torch.zeros_like(ground_truth),
+            action_t=torch.zeros(1),
+            sigma=torch.zeros(1),
+            teacher_velocity=torch.zeros_like(ground_truth),
+            teacher_action=torch.full_like(ground_truth, 9.0),
+            ground_truth_action=ground_truth,
+            initial_state=torch.zeros(1, 2),
+            reference_velocity=None,
+            observation_tokens=torch.ones(1, 3, 2),
+            observation_mask=torch.ones(1, 3, dtype=torch.bool),
+            video_kv_cache=(
+                {"k": torch.ones(1, 2, 4), "v": torch.ones(1, 2, 4)},
+            ),
+            teacher_queries=torch.ones(1, 2, 4),
+            teacher_editor_trace={},
+            teacher_action_responses={},
+            action_is_pad=None,
+            chunk_index=torch.zeros(1, dtype=torch.long),
+            anchor_step=torch.zeros(1, dtype=torch.long),
+        )
+
+        torch.manual_seed(7)
+        updated = adapter.prepare_batch({}, targets)
+
+        reconstructed_noise = updated.teacher_velocity + ground_truth
+        expected_noisy = (
+            ground_truth * (1.0 - updated.sigma[:, None, None])
+            + reconstructed_noise * updated.sigma[:, None, None]
+        )
+        torch.testing.assert_close(updated.noisy_action, expected_noisy)
+        torch.testing.assert_close(
+            updated.action_t,
+            updated.sigma * float(config.num_train_timesteps),
+        )
+        self.assertGreater(float(updated.sigma.min()), 0.0)
+        self.assertLessEqual(float(updated.sigma.max()), 1.0)
+        torch.testing.assert_close(updated.observation_tokens, targets.observation_tokens)
+        torch.testing.assert_close(
+            updated.video_kv_cache[0]["k"], targets.video_kv_cache[0]["k"]
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in student.action_expert.parameters()
+            )
+        )
 
     def test_editor_only_view_survives_aha_trainer_freeze_sequence(self) -> None:
         config = OVCRSConfig(
