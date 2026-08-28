@@ -29,11 +29,13 @@ def _git_commit(path: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
-def _ensure_policy_link(robotwin_root: Path, policy_dir: Path) -> Path:
+def _ensure_policy_link(
+    robotwin_root: Path, policy_dir: Path, policy_name: str
+) -> Path:
     policy_root = robotwin_root / "policy"
     if not policy_root.is_dir():
         raise FileNotFoundError(f"RoboTwin policy directory not found: {policy_root}")
-    target = policy_root / "ovcrs_policy"
+    target = policy_root / policy_name
     source = policy_dir.resolve()
     if target.is_symlink():
         if target.resolve() != source:
@@ -62,6 +64,11 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument(
+        "--policy-name",
+        choices=("ovcrs_policy", "aha_ovcrs_policy"),
+        default="ovcrs_policy",
+    )
+    parser.add_argument(
         "--task-config",
         choices=("demo_clean", "demo_randomized"),
         default="demo_clean",
@@ -83,7 +90,9 @@ def main() -> None:
         if not required.exists():
             raise FileNotFoundError(required)
 
-    policy_link = _ensure_policy_link(robotwin_root, policy_dir)
+    policy_link = _ensure_policy_link(
+        robotwin_root, policy_dir, args.policy_name
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
@@ -92,7 +101,7 @@ def main() -> None:
         "--config",
         str(runtime_config),
         "--overrides",
-        *_override("policy_name", "ovcrs_policy"),
+        *_override("policy_name", args.policy_name),
         *_override("task_name", args.task),
         *_override("task_config", args.task_config),
         *_override("eval_num_episodes", args.episodes),
@@ -114,6 +123,7 @@ def main() -> None:
         "task_config": args.task_config,
         "episodes": args.episodes,
         "seed": args.seed,
+        "policy_name": args.policy_name,
         "physical_gpu": args.gpu_id,
         "runtime_config": str(runtime_config),
         "runtime_config_sha256": _sha256(runtime_config),

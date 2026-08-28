@@ -33,6 +33,8 @@ class AHAOVCRSTeacherBatch:
     chunk_index: torch.Tensor
     anchor_step: torch.Tensor
     response_context: Mapping[str, Any] | None = None
+    action_context: torch.Tensor | None = None
+    action_context_mask: torch.Tensor | None = None
 
 
 def _evenly_spaced_indices(total: int, keep: int, device: torch.device) -> torch.Tensor:
@@ -317,6 +319,7 @@ class AHAOVCRTeacherAdapter(nn.Module):
         sigma_shift: float | None = None,
         capture_structural_targets: bool = True,
         capture_action_response_targets: bool = False,
+        current_conditioning_only: bool = False,
     ) -> None:
         super().__init__()
         self.teacher = teacher
@@ -327,6 +330,7 @@ class AHAOVCRTeacherAdapter(nn.Module):
         self.sigma_shift = sigma_shift
         self.capture_structural_targets = bool(capture_structural_targets)
         self.capture_action_response_targets = bool(capture_action_response_targets)
+        self.current_conditioning_only = bool(current_conditioning_only)
         self.target_source = (
             "ground_truth_with_aha_response"
             if self.capture_action_response_targets
@@ -335,6 +339,10 @@ class AHAOVCRTeacherAdapter(nn.Module):
         if self.capture_structural_targets and self.capture_action_response_targets:
             raise ValueError(
                 "Structural and response-only AHA capture modes are mutually exclusive"
+            )
+        if self.current_conditioning_only and not self.capture_structural_targets:
+            raise ValueError(
+                "current_conditioning_only requires structural AHA conditioning"
             )
         if len(self.teacher_layer_mapping) != student_config.num_layers:
             raise ValueError(
@@ -413,6 +421,8 @@ class AHAOVCRTeacherAdapter(nn.Module):
         self,
         sample: dict[str, Any],
         tiled: bool,
+        *,
+        video_state_only: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         model = self.raw_model
         editor = model.mot.chunk_kv_cache_editor
@@ -538,7 +548,19 @@ class AHAOVCRTeacherAdapter(nn.Module):
             wrapped_build_layer_updated_cache, editor
         )
         try:
-            rollout = self._rollout(sample, tiled)
+            if video_state_only:
+                prepare_video_state = getattr(
+                    model, "_prepare_distill_video_state", None
+                )
+                if not callable(prepare_video_state):
+                    raise TypeError(
+                        "AHA teacher cannot prepare current video conditioning"
+                    )
+                rollout = {
+                    "video_state": prepare_video_state(sample, tiled=tiled)
+                }
+            else:
+                rollout = self._rollout(sample, tiled)
         finally:
             observation_handle.remove()
             query_handle.remove()
@@ -562,6 +584,34 @@ class AHAOVCRTeacherAdapter(nn.Module):
             num_chunks=num_chunks,
             student_config=self.student_config,
             device=device,
+        )
+
+    def _action_context_from_video_state(
+        self, video_state: Mapping[str, Any]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.student_config.action_architecture != "aha_aligned":
+            return None, None
+        action_context = video_state.get("context")
+        action_context_mask = video_state.get("context_mask")
+        if not isinstance(action_context, torch.Tensor) or action_context.ndim != 3:
+            raise RuntimeError("AHA video state did not expose [B,L,D] task context")
+        if action_context.shape[-1] != self.student_config.text_context_dim:
+            raise ValueError(
+                "AHA task context differs from the aligned student text dimension: "
+                f"{action_context.shape[-1]} vs "
+                f"{self.student_config.text_context_dim}"
+            )
+        if not isinstance(action_context_mask, torch.Tensor):
+            action_context_mask = torch.ones(
+                action_context.shape[:2],
+                device=action_context.device,
+                dtype=torch.bool,
+            )
+        if tuple(action_context_mask.shape) != tuple(action_context.shape[:2]):
+            raise ValueError("AHA task context mask must match [B,L]")
+        return (
+            action_context.detach(),
+            action_context_mask.detach().to(dtype=torch.bool),
         )
 
     @torch.no_grad()
@@ -941,6 +991,147 @@ class AHAOVCRTeacherAdapter(nn.Module):
         return velocity, response_trace
 
     @torch.no_grad()
+    def _prepare_current_conditioning_batch(
+        self,
+        sample: dict[str, Any],
+        *,
+        tiled: bool,
+    ) -> AHAOVCRSTeacherBatch:
+        """Capture current AHA K/V and context without running action denoising."""
+
+        rollout, captured = self._rollout_with_ovcr_trace(
+            sample, tiled, video_state_only=True
+        )
+        video_state = rollout["video_state"]
+        ground_truth_action = video_state.get("action")
+        if not isinstance(ground_truth_action, torch.Tensor):
+            raise RuntimeError("AHA video state did not contain ground-truth actions")
+        ground_truth_action = ground_truth_action.detach()
+        batch_size, action_horizon, action_dim = ground_truth_action.shape
+        chunk_size = self.student_config.action_chunk_size
+        if action_dim != self.student_config.action_dim:
+            raise ValueError(
+                f"AHA action dim {action_dim} differs from OVCR-S "
+                f"{self.student_config.action_dim}"
+            )
+        if action_horizon % chunk_size:
+            raise ValueError("AHA action horizon is not divisible by the student chunk size")
+        num_chunks = action_horizon // chunk_size
+        chunk_index = self._choose_chunk_indices(
+            sample,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            device=ground_truth_action.device,
+        )
+        ground_truth_chunk = _gather_action_chunk(
+            ground_truth_action, chunk_index, chunk_size
+        )
+
+        if not captured["queries"] or not captured["observation_inputs"]:
+            raise RuntimeError("AHA current-conditioning hooks did not capture inputs")
+        teacher_queries_full = captured["queries"][-1]
+        if teacher_queries_full.shape[:2] != (batch_size, num_chunks):
+            raise RuntimeError("Captured AHA queries do not match action chunks")
+        teacher_queries = _gather_chunk_tokens(teacher_queries_full, chunk_index)
+        observation_flat = captured["observation_inputs"][-1]
+        if observation_flat.ndim != 3 or observation_flat.shape[0] != (
+            batch_size * num_chunks
+        ):
+            raise RuntimeError(
+                "Captured pre-projection observation tokens must be [B*N,S,C]"
+            )
+        observation_tokens_full = observation_flat.reshape(
+            batch_size,
+            num_chunks,
+            observation_flat.shape[1],
+            observation_flat.shape[2],
+        )
+        if observation_tokens_full.shape[-1] != self.student_config.observation_dim:
+            raise ValueError(
+                "OVCR-S observation_dim differs from AHA VAE latent channels"
+            )
+        observation_tokens = _gather_chunk_tokens(
+            observation_tokens_full, chunk_index
+        )
+        observation_mask = torch.ones(
+            observation_tokens.shape[:-1],
+            device=observation_tokens.device,
+            dtype=torch.bool,
+        )
+
+        missing_cache = [
+            layer
+            for layer in range(1, self.student_config.num_layers + 1)
+            if layer not in captured["cache"]
+        ]
+        if missing_cache:
+            raise RuntimeError(f"AHA trace missed mapped cache layers: {missing_cache}")
+        video_kv_cache = tuple(
+            captured["cache"][layer]
+            for layer in range(1, self.student_config.num_layers + 1)
+        )
+
+        proprio = sample.get("proprio")
+        if not isinstance(proprio, torch.Tensor) or proprio.ndim != 3:
+            raise ValueError("sample['proprio'] must be [B,T,D]")
+        if (
+            proprio.shape[0] != batch_size
+            or proprio.shape[-1] != self.student_config.state_dim
+        ):
+            raise ValueError("Dataset proprio differs from the aligned student state")
+        state_indices = (chunk_index * chunk_size).clamp_max(proprio.shape[1] - 1)
+        initial_state = torch.gather(
+            proprio.to(device=ground_truth_action.device),
+            dim=1,
+            index=state_indices.view(batch_size, 1, 1).expand(
+                -1, 1, self.student_config.state_dim
+            ),
+        )[:, 0]
+
+        action_is_pad = sample.get("action_is_pad")
+        if isinstance(action_is_pad, torch.Tensor) and tuple(
+            action_is_pad.shape[:2]
+        ) == (batch_size, action_horizon):
+            action_is_pad = _gather_action_chunk(
+                action_is_pad.to(device=ground_truth_action.device, dtype=torch.bool),
+                chunk_index,
+                chunk_size,
+            )
+        else:
+            action_is_pad = None
+        action_context, action_context_mask = self._action_context_from_video_state(
+            video_state
+        )
+        zeros = torch.zeros(
+            batch_size,
+            device=ground_truth_action.device,
+            dtype=ground_truth_action.dtype,
+        )
+        return AHAOVCRSTeacherBatch(
+            noisy_action=ground_truth_chunk,
+            action_t=zeros,
+            sigma=zeros,
+            teacher_velocity=torch.zeros_like(ground_truth_chunk),
+            teacher_action=ground_truth_chunk,
+            ground_truth_action=ground_truth_chunk,
+            initial_state=initial_state,
+            reference_velocity=None,
+            observation_tokens=observation_tokens,
+            observation_mask=observation_mask,
+            video_kv_cache=video_kv_cache,
+            teacher_queries=teacher_queries,
+            teacher_editor_trace={},
+            teacher_action_responses={},
+            action_is_pad=action_is_pad,
+            chunk_index=chunk_index,
+            anchor_step=torch.zeros(
+                batch_size, device=ground_truth_action.device, dtype=torch.long
+            ),
+            action_context=action_context,
+            action_context_mask=action_context_mask,
+        )
+
+    @torch.no_grad()
     def prepare_batch(
         self,
         sample: dict[str, Any],
@@ -948,6 +1139,8 @@ class AHAOVCRTeacherAdapter(nn.Module):
         tiled: bool = False,
     ) -> AHAOVCRSTeacherBatch:
         self.teacher.eval()
+        if self.current_conditioning_only:
+            return self._prepare_current_conditioning_batch(sample, tiled=tiled)
         if not self.capture_structural_targets:
             if self.capture_action_response_targets:
                 return self._prepare_response_only_batch(sample, tiled=tiled)
@@ -1140,6 +1333,10 @@ class AHAOVCRTeacherAdapter(nn.Module):
         )
         sigma = (action_t.float() / train_timesteps).clamp(0.0, 1.0)
 
+        action_context, action_context_mask = self._action_context_from_video_state(
+            video_state
+        )
+
         return AHAOVCRSTeacherBatch(
             noisy_action=noisy_action,
             action_t=action_t,
@@ -1158,4 +1355,6 @@ class AHAOVCRTeacherAdapter(nn.Module):
             action_is_pad=action_is_pad,
             chunk_index=chunk_index,
             anchor_step=anchor_step,
+            action_context=action_context,
+            action_context_mask=action_context_mask,
         )

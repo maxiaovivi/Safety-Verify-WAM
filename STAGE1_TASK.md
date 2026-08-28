@@ -1,152 +1,99 @@
-# Stage 1：Efficient 尺寸 OVCR-S 动作生成模型
+# Stage 1：Efficient 尺寸的小 AHA 动作生成器
 
-## 任务目标
+## 当前目标
 
-最终学生固定为 Efficient-WAM-S 尺寸。当前主训练直接使用 RoboTwin 真实动作做 flow matching，冻结已有 Efficient 动作专家，只训练新增的 query encoder 和 K/V editor。AHA-WAM 不参与这一阶段的在线前向；它只在后续 response distillation 对照中提供动作注意力响应。Stage 1 不训练安全分类头，也不需要风险标签。
+Stage 1 先验证一个结构对齐的、小尺寸 AHA ActionDiT 能否读取 AHA 当前观察 K/V、任务文本和当前机器人状态，并在完整 RoboTwin 数据上学习 16×14 动作 flow。安全分类、风险标签和小视频骨干不属于这一阶段。
 
-学生接收以下张量：
+旧运行 `aha-current-gt-action-full80k-b16-seed42` 在 step 36000 停止。它保留为 Efficient 风格联合注意力的比较组，不再续训，因为其动作层缺少 AHA 的独立上下文注意力。新结构从 step 0 计数；旧权重只用于初始化兼容部分。
 
-- Efficient-WAM VAE 编码的当前观察 latent tokens；
-- 冻结 Efficient 视频骨干真实产生的完整 12 层 K/V，包含当前帧和想象未来；
-- Efficient 归一化空间内的当前状态、带噪动作 chunk 和动作时间步。
+## 固定尺寸
 
-数据集动作先从 AHA 数据加载器的归一化空间还原到物理 qpos，再转入 Efficient 的归一化空间。每个 batch 在 1000 档 shifted flow scheduler 中均匀采样噪声等级，学生输出 16×14 的动作 flow velocity。训练完成后只保存 OVCR-S 学生权重，不保存冻结的 Efficient 视频模型。
+- 12 个动作层；action hidden 768；FFN 3072；
+- 16 heads × 128 head dim，联合注意力空间为 2048；
+- 动作 chunk 为 16×14；
+- 32 个 observation queries，query dim 512；
+- 共享 rank-256 K/V editor；
+- 任务文本与 proprio context 的输入维度为 4096。
 
-## 固定网络结构
+尺寸以 `configs/stage1_ovcr_s.yaml` 为准。正式运行不得静默修改。
 
-- 视频 K/V：12 层，2048 维，16 heads × 128；
-- 观察查询：32 queries，query dim 512；
-- K/V 编辑器：共享低秩编辑器，rank 256，逐层 gate 初始值 -4；
-- 动作专家：12 层，hidden dim 768，FFN dim 3072；
-- 动作 chunk：16 steps × 14 dims；
-- 蒸馏观察层：学生第 `[3, 6, 9, 12]` 层。
+## AHA 对齐的数据流
 
-参数以 `configs/stage1_ovcr_s.yaml` 为准。服务器实验不得悄悄修改这些尺寸；如因 checkpoint 或数据维度冲突必须修改，需要停止正式训练并报告冲突。
-
-## 代码入口
-
-- 学生网络：`safety_verify_wam.stage1.OVCRSActionGenerator`
-- AHA 教师适配：`safety_verify_wam.stage1.AHAOVCRTeacherAdapter`
-- AHA Trainer 兼容模型：`safety_verify_wam.stage1.AHAOVCRSStage1Program`
-- Efficient 训练输入：`safety_verify_wam.stage1.efficient_training.EfficientStudentTrainingAdapter`
-- 真实动作训练工厂：`safety_verify_wam.stage1.create_ground_truth_ovcr_s_stage1`
-- AHA 在线蒸馏工厂：`safety_verify_wam.stage1.create_aha_ovcr_s_stage1`
-
-两个工厂都返回 `AHAOVCRSStage1Program`，可以直接接入 AHA-WAM 已有的 `Wan22Trainer` 和 RoboTwin 数据加载器。真实动作工厂使用轻量 `GroundTruthTargetAdapter`，不会实例化 AHA 教师。
-
-## 服务器准备
-
-1. 完整克隆本仓库 `main`，记录 commit SHA；不要使用不完整源码副本。
-2. 完整克隆官方 AHA-WAM，并记录 commit SHA。主训练只复用其 Trainer 和数据加载器；后续 response distillation 所用版本必须包含：
-   - `AHAWAMTeacher.rollout_action_latent_states`；
-   - `AHAWAM._predict_action_flow_with_video_state`；
-   - `LayerwiseChunkKVCacheEditor.build_layer_updated_cache`。
-3. 在 AHA 环境中执行 `pip install -e <Safety-Verify-WAM>`。
-4. 准备 AHA-WAM checkpoint、完整 Efficient-WAM checkpoint、Wan2.2 权重、RoboTwin 数据集，以及 AHA/Efficient 两套 normalization statistics。
-5. 主训练将顶层模型换成 `create_ground_truth_ovcr_s_stage1`，不传 `teacher`；传入 `student_config`、`loss_config` 和 `efficient_conditioning`。后者必须包含 Efficient 部署配置、两套 statistics 路径和 Efficient Python 根目录。
-6. Efficient-WAM 动作专家 checkpoint 传给 `efficient_action_checkpoint`。正式训练优先使用该初始化；随机初始化只用于接口检查或对照实验。
-
-AHA 模型配置需要保留 `num_history_frames`，并确保数据集按相同数量提供历史帧。所有路径写进服务器本地配置，checkpoint、数据和输出目录不得加入 Git。
-
-## 训练前检查
-
-先执行一个 batch 的 forward/backward，不保存正式结果。必须记录：
-
-- 主训练确认没有实例化 AHA；response distillation 才检查 AHA checkpoint 是否严格加载；
-- Efficient 动作专家成功加载、缺失和形状不一致的 tensor 数量；
-- observation tokens、完整 12 层 K/V、当前状态和输出动作的实际 shape；
-- 教师所有参数 `requires_grad=False`；
-- query encoder、K/V editor、动作 block 1/6/12、action decoder 的梯度范数；
-- 单卡或每个 rank 的峰值显存、forward 时间和 backward 时间。
-
-预期核心 shape：
-
-| 张量 | Shape |
-| --- | --- |
-| observation tokens | `[B, S_obs, 48]` |
-| compact video K/V | 12 × `[B, S_video, 2048]` |
-| student queries | `[B, 1, 32, 512]` |
-| updated K/V | 12 × `[B, 1, S_video, 2048]` |
-| noisy/predicted action | `[B, 16, 14]` |
-| initial state | `[B, 14]` |
-
-出现 shape 错误、NaN/Inf、教师梯度、学生完全没有梯度或 OOM 时，先停止并保存完整错误日志，不要直接降低网络尺寸。
-
-## 训练顺序
-
-### 方向检查
-
-- 固定训练和验证样本清单；
-- 固定 seed 42；
-- 单卡 AdamW 使用 FP32 学生主权重和优化器状态，前向仍使用 BF16 autocast；
-- 在更新参数前完成一次验证，记为 `step_000000`；
-- 训练 100～300 optimizer steps，仅用于检查梯度、数值和数据路径；
-- 每 10 steps 记录所有分项损失和梯度范数；
-- 每 50 steps 在同一验证子集评估；
-- 保存短训练结束 checkpoint。
-
-200 步、batch 32 只看到 6400 个窗口，不能据此判断最终任务效果。方向检查通过后，先跑 2000 optimizer steps；这一轮使用 constant LR，避免把完整 cosine 周期压缩进短实验。
-
-### 正式训练
-
-- 使用互斥的 train/val episode；记录 episode 数和 action chunk 数；
-- 从 Efficient 动作专家初始化；
-- 优先从 batch size 1 或 2 开始，根据实测显存设置 gradient accumulation；
-- 使用 bf16、梯度裁剪 1.0；
-- 每次评估使用固定 validation manifest 和固定随机种子；
-- 保存 `latest` 和验证集 teacher-action loss 最低的 `best` checkpoint；
-- 至少保留 step 0、best、final 三组离线预测结果。
-
-正式训练先跑 seed 42。确认有效后，再用 seed 43、44 复查结果是否稳定。
-
-## 损失含义
-
-当前真实动作阶段的总损失为：
+每个动作层执行：
 
 ```text
-L = 1.00 L_GT-flow
+noisy action --Linear--> action tokens --1D RoPE--+
+                                                     | mixed attention
+AHA current-frame K/V --OVCR-S editor---------------+
+                                                     |
+task T5 tokens + current proprio token               | residual
+                 --text embedding--independent cross-attention
+                                                     |
+                                                   FFN
 ```
 
-- `GT-flow`：以 RoboTwin 真实动作为干净样本，在 Efficient 空间重新加噪；目标 velocity 为 `noise - action`，与 Efficient-WAM 官方动作训练代码一致；
-- 该阶段冻结 Efficient 动作专家，只更新 query encoder 和 K/V editor；
-- teacher-action、query、route、K/V delta、preservation 和 response 权重均为 0。
+必须满足：
 
-后续 AHA response distillation 保持 GT-flow 权重 1.0，只增加映射层 `[3, 6, 9, 12]` 的动作 attention response cosine。教师和学生 response 先投影到 256 维，KD 权重按 `0.2 → 0.1 → 0` 退火。该阶段需单独实验分支和结果，不能与 GT-only 结果混记。
+- action encoder 是一层 `Linear(14, 768)`；
+- 没有 state token、register token或固定位置 embedding；
+- mixed attention 使用独立且带 bias 的 `q/k/v/o`；
+- action query/key 使用与 AHA 相同的 1D RoPE；
+- 每层包含 `norm3 -> cross_attn -> residual`；
+- task T5 context 与当前 14 维 proprio 经 4096 维 context 路径进入 cross-attention；
+- action head 是 `Linear(768, 14)`，不附加 Efficient decoder 的 AdaLN；
+- 单个 16-step chunk 内为双向动作注意力。
 
-## 需要回传的结果
+`ObservationQueryEncoder` 与共享 rank-256 editor 是本项目的小型化设计，不声称与完整 AHA editor 参数结构相同。
 
-请把下列内容一起返回，不能只发一张 loss 截图：
+## 初始化
 
-1. 两个仓库的 commit SHA、当前分支和 `git status`；
-2. 完整启动命令和 resolved config；
-3. GPU 型号/数量、CUDA、PyTorch、mixed precision、全局 batch size；
-4. 数据集名称、train/val episode 数、chunk 数、normalization statistics 文件哈希；
-5. `step_000000`、best、final 的全部训练和验证分项指标；
-6. 原始逐 step 指标文件，优先 JSONL 或 CSV；
-7. query encoder、editor、动作 block 1/6/12、decoder 的梯度范数；
-8. 峰值显存、每 optimizer step 时间和样本吞吐量；
-9. `best` checkpoint 路径、SHA256 和对应 step；
-10. 固定验证样本上的 `predictions.npz`，包含 noisy action、teacher action、ground-truth action、student action、sigma、chunk index 和 sample id；
-11. 若已接入多步生成，返回 1/2/4-step 的 student-vs-teacher 和 student-vs-GT action MSE；
-12. 失败时返回最早出现异常前后至少 50 行完整日志。
+正式候选使用两种明确来源：
 
-建议同时生成 `summary.json`，至少包含 `initial`、`best`、`final`、`resources`、`data`、`commits` 和 `checkpoint_sha256` 字段。
+1. 旧 step 36000 只加载 query encoder 与 K/V editor；
+2. 完整 AHA action expert 做确定性结构切片：30→12 层、24→16 heads、1024→768 hidden、4096→3072 FFN；
+3. shape 完全相同的 AHA proprio encoder 直接复制；
+4. 每个 checkpoint 保存初始化来源、层映射、选择规则和旧 checkpoint 路径。
 
-## 判断训练有效
+旧动作权重迁移路线只作为短测对照。它需要丢弃旧 state/register 数据流，并改变 action encoder 与 head，因此不能默认视为连续恢复。
 
-以下数值是本项目 Stage 1 的建议接受条件，需要在固定验证集上计算：
+## 训练输入与损失
 
-- 所有损失和梯度保持有限值，没有 NaN/Inf；
-- step 10 以后，query encoder、editor、动作早/中/晚层和 decoder 均出现非零梯度；
-- GT-only 组以固定验证集 `val_loss_velocity` 和 `val_loss_ground_truth_action` 为主要离线指标；
-- AHA response 组另外报告映射层 response cosine，不能用它替代真实动作误差；
-- `val_loss_preservation` 没有持续发散；
-- 固定噪声下的多步 student-vs-GT action MSE 相比未训练学生应下降；
-- student action 的逐维标准差没有坍缩，建议保持在 teacher 对应标准差的 0.5～1.5 倍；
-- 训练集下降但验证集没有改善，不能判定有效。
+- AHA 只执行当前观察视频 prefill，提供原始 48 维观察 tokens、映射后的 12 层当前帧 K/V、任务 T5 context；
+- 当前 proprio 从所选动作 chunk 起点读取，和 AHA 使用同一份归一化数据；
+- 不运行无用的 16-step 教师动作去噪；
+- 完整 RoboTwin 数据，1000 档 uniform shifted noise，shift 5；
+- 当前损失为 `1.0 × GT flow velocity`；
+- action expert、proprio encoder、query encoder 和 K/V editor 一起训练；
+- AHA 教师参数始终冻结。
 
-离线条件通过后，直接使用同一套 Efficient 完整 K/V 部署路径做配对闭环任务测试。Stage 1 的结果只能说明动作行为蒸馏有效，不能说明风险判别已经有效。
+## 开跑前检查
 
-## 实验交付
+必须全部通过：
 
-大型 checkpoint、日志、视频和数组保存在 Git 外。请提供 artifact manifest，把每个文件映射到准确的分支、commit、配置哈希、数据 split、seed 和训练 step。实验结束后创建并验证包含全部实验分支的 Git bundle，再把 bundle、manifest 和结果目录一起返回。
+- 单元测试确认动作 token 数恰好为 16，cross-attention、RoPE、状态和文本路径存在；
+- AHA structured slice 初始化覆盖 action expert 的每个 tensor；
+- 旧 checkpoint 的 conditioning-only 加载没有形状冲突；
+- 一个真实 batch 前向、反向和 optimizer step 都为有限值；
+- step 2 后 proprio、text embedding、cross-attention、早中晚 action block、query encoder、editor 均有非零梯度；
+- 训练和 RoboTwin policy 都传入相同的 task context、context mask 与当前 proprio；
+- 记录参数量、峰值显存、data/fwd/bwd/optimizer 时间。
+
+## 短测与继续条件
+
+- step 0：固定验证面板与动作分布；
+- step 50/200：检查学习方向、梯度与数值；
+- step 2000：固定面板、多步动作去噪和小规模 RoboTwin 任务测试；
+- 只有固定验证集 GT action MSE 改善、动作方差未坍缩，并且至少一个任务/seed 出现相对改善，才继续更长训练；
+- 结构切片初始化与旧动作迁移使用相同数据、seed、batch 和验证面板做短测，不混记结果。
+
+正式训练从 step 0 开始，checkpoint 间隔不小于 2000 steps，避免磁盘被重复权重占满。大型权重、日志、数组和视频放在 Git 外，artifact manifest 必须记录 branch、commit、配置哈希、task、setting 和 seed。
+
+## 当前尚未包含
+
+Stage 1 的任务测试仍使用完整 AHA 视频 prefill。最终可独立部署的小 AHA 还需要：
+
+- 12 层、2048 hidden 的小视频骨干及其训练；
+- 需要时加入跨 chunk action history；
+- 对小视频骨干与动作专家做联合训练和完整任务评估。
+
+因此 Stage 1 通过只说明“小 AHA 动作路径有效”，不能说明整个小 AHA 已完成。

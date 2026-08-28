@@ -27,6 +27,8 @@ class OVCRSConfig:
     action_ffn_dim: int = 3072
     action_chunk_size: int = 16
     num_registers: int = 4
+    action_architecture: str = "efficient_joint"
+    text_context_dim: int = 4096
     time_embedding_dim: int = 256
     num_train_timesteps: int = 1000
     distill_layers: tuple[int, ...] = (3, 6, 9, 12)
@@ -56,6 +58,17 @@ class OVCRSConfig:
             raise ValueError("Action expert dimensions must be positive")
         if self.action_chunk_size <= 0 or self.num_queries <= 0:
             raise ValueError("action_chunk_size and num_queries must be positive")
+        if self.action_architecture not in {"efficient_joint", "aha_aligned"}:
+            raise ValueError(
+                "action_architecture must be 'efficient_joint' or 'aha_aligned'"
+            )
+        if self.text_context_dim <= 0:
+            raise ValueError("text_context_dim must be positive")
+        if self.action_architecture == "aha_aligned":
+            if self.num_registers != 0:
+                raise ValueError("AHA-aligned action experts do not use register tokens")
+            if self.head_dim % 2:
+                raise ValueError("AHA-aligned action RoPE requires an even head_dim")
         if self.editor_rank <= 0 or self.editor_rank > self.video_dim:
             raise ValueError("editor_rank must be in (0, video_dim]")
         if self.time_embedding_dim % 2:
@@ -125,6 +138,46 @@ def _three_layer_mlp(input_dim: int, output_dim: int) -> nn.Sequential:
         nn.SiLU(),
         nn.Linear(output_dim, output_dim),
     )
+
+
+def _apply_rotary_embedding(tensor: torch.Tensor) -> torch.Tensor:
+    """Apply AHA's adjacent-pair 1D RoPE to [B,T,H,D] action Q/K."""
+
+    if tensor.ndim != 4 or tensor.shape[-1] % 2:
+        raise ValueError("RoPE input must be [B,T,H,D] with an even head dimension")
+    length = int(tensor.shape[1])
+    head_dim = int(tensor.shape[-1])
+    positions = torch.arange(length, device=tensor.device, dtype=torch.float64)
+    frequencies = torch.pow(
+        torch.tensor(10000.0, device=tensor.device, dtype=torch.float64),
+        -torch.arange(0, head_dim, 2, device=tensor.device, dtype=torch.float64)
+        / head_dim,
+    )
+    angles = torch.outer(positions, frequencies)
+    cosine = angles.cos().view(1, length, 1, head_dim // 2)
+    sine = angles.sin().view(1, length, 1, head_dim // 2)
+    pairs = tensor.float().reshape(*tensor.shape[:-1], head_dim // 2, 2)
+    first, second = pairs.unbind(dim=-1)
+    rotated = torch.stack(
+        [first * cosine - second * sine, first * sine + second * cosine],
+        dim=-1,
+    )
+    return rotated.flatten(-2).to(dtype=tensor.dtype)
+
+
+def _selection_indices(
+    total: int, keep: int, *, device: torch.device
+) -> torch.Tensor:
+    if keep <= 0 or keep > total:
+        raise ValueError(f"Cannot select {keep} entries from {total}")
+    if keep == total:
+        return torch.arange(total, device=device, dtype=torch.long)
+    indices = torch.round(
+        torch.linspace(0, total - 1, keep, device=device)
+    ).long()
+    if torch.unique(indices).numel() != keep:
+        raise RuntimeError("Even structural selection produced duplicate indices")
+    return indices
 
 
 class ObservationQueryEncoder(nn.Module):
@@ -563,6 +616,242 @@ class CompactActionExpert(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
 
 
+class AHAAlignedSelfAttention(nn.Module):
+    """AHA ActionDiT Q/K/V/O projections used inside mixed MoT attention."""
+
+    def __init__(self, config: OVCRSConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.q = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.k = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.v = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.o = nn.Linear(config.video_dim, config.action_hidden_dim)
+        self.norm_q = RMSNorm(config.video_dim, config.eps)
+        self.norm_k = RMSNorm(config.video_dim, config.eps)
+
+    def project_qkv(
+        self, action_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, length = action_tokens.shape[:2]
+        query = self.norm_q(self.q(action_tokens)).view(
+            batch, length, self.config.num_heads, self.config.head_dim
+        )
+        key = self.norm_k(self.k(action_tokens)).view(
+            batch, length, self.config.num_heads, self.config.head_dim
+        )
+        value = self.v(action_tokens).view(
+            batch, length, self.config.num_heads, self.config.head_dim
+        )
+        return (
+            _apply_rotary_embedding(query),
+            _apply_rotary_embedding(key),
+            value,
+        )
+
+
+class AHAAlignedCrossAttention(nn.Module):
+    """AHA ActionDiT cross-attention at the compact student's dimensions."""
+
+    def __init__(self, config: OVCRSConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.q = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.k = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.v = nn.Linear(config.action_hidden_dim, config.video_dim)
+        self.o = nn.Linear(config.video_dim, config.action_hidden_dim)
+        self.norm_q = RMSNorm(config.video_dim, config.eps)
+        self.norm_k = RMSNorm(config.video_dim, config.eps)
+
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, action_length, _ = action_tokens.shape
+        if context.ndim != 3 or context.shape[0] != batch:
+            raise ValueError("Action context must be [B,L,action_hidden_dim]")
+        if tuple(context_mask.shape) != tuple(context.shape[:2]):
+            raise ValueError("Action context mask must match [B,L]")
+        if not context_mask.any(dim=1).all():
+            raise ValueError("Every action context needs at least one valid token")
+
+        query = self.norm_q(self.q(action_tokens)).view(
+            batch, action_length, self.config.num_heads, self.config.head_dim
+        )
+        context_length = int(context.shape[1])
+        key = self.norm_k(self.k(context)).view(
+            batch, context_length, self.config.num_heads, self.config.head_dim
+        )
+        value = self.v(context).view(
+            batch, context_length, self.config.num_heads, self.config.head_dim
+        )
+        response = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=context_mask[:, None, None, :],
+            dropout_p=0.0,
+        )
+        return self.o(response.transpose(1, 2).flatten(2))
+
+
+class AHAAlignedActionBlock(nn.Module):
+    """Compact MoT attention followed by AHA's independent context read."""
+
+    def __init__(self, config: OVCRSConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.self_attn = AHAAlignedSelfAttention(config)
+        self.cross_attn = AHAAlignedCrossAttention(config)
+        self.norm1 = FloatLayerNorm(config.action_hidden_dim, config.eps)
+        self.norm2 = FloatLayerNorm(config.action_hidden_dim, config.eps)
+        self.norm3 = nn.LayerNorm(config.action_hidden_dim, eps=config.eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(config.action_hidden_dim, config.action_ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(config.action_ffn_dim, config.action_hidden_dim),
+        )
+        self.modulation = nn.Parameter(
+            torch.randn(1, 6, config.action_hidden_dim)
+            / math.sqrt(config.action_hidden_dim)
+        )
+
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        time_modulation: torch.Tensor,
+        updated_cache: Mapping[str, torch.Tensor],
+        action_context: torch.Tensor,
+        action_context_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if time_modulation.shape[:2] != action_tokens.shape[:2]:
+            raise ValueError("time_modulation and action token lengths differ")
+        modulation = (
+            self.modulation.unsqueeze(0).to(time_modulation.dtype) + time_modulation
+        ).chunk(6, dim=2)
+        shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = [
+            value.squeeze(2) for value in modulation
+        ]
+        normalized = self.norm1(action_tokens).float() * (1 + scale_attn) + shift_attn
+        query, action_key, action_value = self.self_attn.project_qkv(
+            normalized.to(action_tokens.dtype)
+        )
+
+        cache_key = updated_cache["k"]
+        cache_value = updated_cache["v"]
+        if cache_key.ndim != 4 or cache_key.shape[1] != 1:
+            raise ValueError("OVCR-S action generation currently expects one action chunk")
+        cache_key = cache_key[:, 0].view(
+            action_tokens.shape[0], -1, self.config.num_heads, self.config.head_dim
+        )
+        cache_value = cache_value[:, 0].view_as(cache_key)
+        key = torch.cat([cache_key, action_key], dim=1).transpose(1, 2)
+        value = torch.cat([cache_value, action_value], dim=1).transpose(1, 2)
+        response = F.scaled_dot_product_attention(
+            query.transpose(1, 2), key, value, dropout_p=0.0
+        ).transpose(1, 2)
+        response_flat = response.flatten(2)
+        projected = self.self_attn.o(response_flat)
+        action_tokens = action_tokens + projected * gate_attn
+
+        action_tokens = action_tokens + self.cross_attn(
+            self.norm3(action_tokens), action_context, action_context_mask
+        )
+        ffn_input = self.norm2(action_tokens).float() * (1 + scale_ffn) + shift_ffn
+        ffn_output = self.ffn(ffn_input.to(dtype=self.ffn[0].weight.dtype))
+        action_tokens = action_tokens + ffn_output * gate_ffn
+        return action_tokens, response_flat
+
+
+class AHAAlignedActionExpert(nn.Module):
+    """AHA ActionDiT dataflow scaled to the Efficient-WAM-S action dimensions."""
+
+    def __init__(self, config: OVCRSConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_dim = config.action_hidden_dim
+        self.action_dim = config.action_dim
+        self.ffn_dim = config.action_ffn_dim
+        self.num_heads = config.num_heads
+        self.attn_head_dim = config.head_dim
+        self.freq_dim = config.time_embedding_dim
+        self.action_encoder = nn.Linear(config.action_dim, config.action_hidden_dim)
+        self.text_embedding = nn.Sequential(
+            nn.Linear(config.text_context_dim, config.action_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(config.action_hidden_dim, config.action_hidden_dim),
+        )
+        self.time_embedding = nn.Sequential(
+            nn.Linear(config.time_embedding_dim, config.action_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.action_hidden_dim, config.action_hidden_dim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.action_hidden_dim, 6 * config.action_hidden_dim),
+        )
+        self.blocks = nn.ModuleList(
+            [AHAAlignedActionBlock(config) for _ in range(config.num_layers)]
+        )
+        self.head = nn.Linear(config.action_hidden_dim, config.action_dim)
+
+    def encode_action(self, noisy_action: torch.Tensor) -> torch.Tensor:
+        return self.action_encoder(noisy_action)
+
+    def encode_context(
+        self,
+        task_context: torch.Tensor | None,
+        task_context_mask: torch.Tensor | None,
+        state_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if task_context is None:
+            raise ValueError("AHA-aligned action generation requires task context")
+        if task_context.ndim != 3:
+            raise ValueError("task_context must be [B,L,text_context_dim]")
+        if task_context.shape[-1] != self.config.text_context_dim:
+            raise ValueError(
+                f"Expected task context dim {self.config.text_context_dim}, "
+                f"got {task_context.shape[-1]}"
+            )
+        if state_context.ndim == 2:
+            state_context = state_context.unsqueeze(1)
+        if state_context.ndim != 3 or tuple(state_context.shape[1:]) != (
+            1,
+            self.config.text_context_dim,
+        ):
+            raise ValueError("state_context must be [B,1,text_context_dim]")
+        if state_context.shape[0] != task_context.shape[0]:
+            raise ValueError("Task context and initial state batch sizes differ")
+        if task_context_mask is None:
+            task_context_mask = torch.ones(
+                task_context.shape[:2], device=task_context.device, dtype=torch.bool
+            )
+        if tuple(task_context_mask.shape) != tuple(task_context.shape[:2]):
+            raise ValueError("task_context_mask must match [B,L]")
+        task_context_mask = task_context_mask.to(
+            device=task_context.device, dtype=torch.bool
+        )
+        if not task_context_mask.any(dim=1).all():
+            raise ValueError("Every sample needs at least one valid task token")
+
+        context_weight = self.text_embedding[0].weight
+        task_context = task_context.to(
+            device=context_weight.device, dtype=context_weight.dtype
+        )
+        state_context = state_context.to(
+            device=context_weight.device, dtype=context_weight.dtype
+        )
+        raw_context = torch.cat([task_context, state_context], dim=1)
+        state_mask = torch.ones(
+            (task_context.shape[0], 1),
+            device=task_context_mask.device,
+            dtype=torch.bool,
+        )
+        context_mask = torch.cat([task_context_mask, state_mask], dim=1)
+        return self.text_embedding(raw_context), context_mask
+
+
 class OVCRSActionGenerator(nn.Module):
     """Generate one action chunk from current observation and compact video K/V."""
 
@@ -571,7 +860,21 @@ class OVCRSActionGenerator(nn.Module):
         self.config = config
         self.query_encoder = ObservationQueryEncoder(config)
         self.cache_editor = SharedLowRankKVEditor(config)
-        self.action_expert = CompactActionExpert(config)
+        self.action_expert: CompactActionExpert | AHAAlignedActionExpert
+        if config.action_architecture == "aha_aligned":
+            self.action_expert = AHAAlignedActionExpert(config)
+            # These live outside ActionDiT in the released AHA model: proprio
+            # belongs to the WAM root and the branch embedding belongs to MoT.
+            self.proprio_encoder: nn.Linear | None = nn.Linear(
+                config.state_dim, config.text_context_dim
+            )
+            self.action_branch_embedding: nn.Parameter | None = nn.Parameter(
+                torch.zeros(2, config.action_hidden_dim)
+            )
+        else:
+            self.action_expert = CompactActionExpert(config)
+            self.proprio_encoder = None
+            self.register_parameter("action_branch_embedding", None)
 
     def _expand_action_time(
         self,
@@ -650,6 +953,8 @@ class OVCRSActionGenerator(nn.Module):
         initial_state: torch.Tensor,
         conditioning: Mapping[str, Any],
         *,
+        action_context: torch.Tensor | None = None,
+        action_context_mask: torch.Tensor | None = None,
         return_trace: bool = False,
     ) -> dict[str, Any]:
         if noisy_action.ndim != 3:
@@ -660,15 +965,36 @@ class OVCRSActionGenerator(nn.Module):
                 f"Expected noisy_action [B,{expected[0]},{expected[1]}], "
                 f"got {tuple(noisy_action.shape)}"
             )
-        registers = (
-            self.action_expert.registers.expand(noisy_action.shape[0], -1, -1)
-            if self.action_expert.registers is not None
-            else None
-        )
-        action_tokens = self.action_expert.input_encoder(
-            initial_state, noisy_action, registers
-        )
         action_length = int(noisy_action.shape[1])
+        aligned_context: torch.Tensor | None = None
+        aligned_context_mask: torch.Tensor | None = None
+        if isinstance(self.action_expert, AHAAlignedActionExpert):
+            if self.proprio_encoder is None or self.action_branch_embedding is None:
+                raise RuntimeError("AHA-aligned root conditioning modules are missing")
+            action_tokens = self.action_expert.encode_action(noisy_action)
+            action_tokens = action_tokens + self.action_branch_embedding[1].view(
+                1, 1, -1
+            )
+            state_context = self.proprio_encoder(
+                initial_state.to(
+                    device=self.proprio_encoder.weight.device,
+                    dtype=self.proprio_encoder.weight.dtype,
+                )
+            ).unsqueeze(1)
+            aligned_context, aligned_context_mask = self.action_expert.encode_context(
+                action_context, action_context_mask, state_context
+            )
+            action_slice = slice(0, action_length)
+        else:
+            registers = (
+                self.action_expert.registers.expand(noisy_action.shape[0], -1, -1)
+                if self.action_expert.registers is not None
+                else None
+            )
+            action_tokens = self.action_expert.input_encoder(
+                initial_state, noisy_action, registers
+            )
+            action_slice = slice(1, 1 + action_length)
         time_embedding, time_modulation = self._time_conditioning(
             action_t, action_length, int(action_tokens.shape[1])
         )
@@ -678,16 +1004,30 @@ class OVCRSActionGenerator(nn.Module):
         if len(updated_cache) != self.config.num_layers:
             raise ValueError("Prepared conditioning has an invalid layer count")
         for layer_index, block in enumerate(self.action_expert.blocks):
-            action_tokens, response = block(
-                action_tokens, time_modulation, updated_cache[layer_index]
-            )
+            if isinstance(block, AHAAlignedActionBlock):
+                if aligned_context is None or aligned_context_mask is None:
+                    raise RuntimeError("AHA-aligned action context was not prepared")
+                action_tokens, response = block(
+                    action_tokens,
+                    time_modulation,
+                    updated_cache[layer_index],
+                    aligned_context,
+                    aligned_context_mask,
+                )
+            else:
+                action_tokens, response = block(
+                    action_tokens, time_modulation, updated_cache[layer_index]
+                )
             layer_number = layer_index + 1
             if layer_number in trace_set:
-                responses[layer_number] = response[:, 1 : 1 + action_length]
-        prediction = self.action_expert.decoder(action_tokens, time_embedding)
+                responses[layer_number] = response[:, action_slice]
+        if isinstance(self.action_expert, AHAAlignedActionExpert):
+            prediction = self.action_expert.head(action_tokens)
+        else:
+            prediction = self.action_expert.decoder(action_tokens, time_embedding)
         outputs: dict[str, Any] = {
-            "action_velocity": prediction[:, 1 : 1 + action_length],
-            "action_hidden": action_tokens[:, 1 : 1 + action_length],
+            "action_velocity": prediction[:, action_slice],
+            "action_hidden": action_tokens[:, action_slice],
         }
         if return_trace:
             outputs["action_responses"] = responses
@@ -702,6 +1042,8 @@ class OVCRSActionGenerator(nn.Module):
         video_kv_cache: Sequence[Mapping[str, torch.Tensor]],
         observation_mask: torch.Tensor | None = None,
         *,
+        action_context: torch.Tensor | None = None,
+        action_context_mask: torch.Tensor | None = None,
         return_trace: bool = False,
     ) -> dict[str, Any]:
         conditioning = self.prepare_conditioning(
@@ -715,6 +1057,8 @@ class OVCRSActionGenerator(nn.Module):
             action_t,
             initial_state,
             conditioning,
+            action_context=action_context,
+            action_context_mask=action_context_mask,
             return_trace=return_trace,
         )
         outputs["queries"] = conditioning["queries"]
@@ -730,6 +1074,8 @@ class OVCRSActionGenerator(nn.Module):
         initial_state: torch.Tensor,
         observation_mask: torch.Tensor | None = None,
         *,
+        action_context: torch.Tensor | None = None,
+        action_context_mask: torch.Tensor | None = None,
         num_steps: int = 4,
         flow_shift: float = 5.0,
         initial_noise: torch.Tensor | None = None,
@@ -769,10 +1115,269 @@ class OVCRSActionGenerator(nn.Module):
                 action_t,
                 initial_state,
                 conditioning,
+                action_context=action_context,
+                action_context_mask=action_context_mask,
                 return_trace=False,
             )["action_velocity"]
             action = action + velocity * (next_sigma - current_sigma).to(action.dtype)
         return action
+
+    def load_aha_proprio_encoder(self, source_module: nn.Module) -> None:
+        """Reuse AHA's shape-identical normalized-state encoder."""
+
+        if self.proprio_encoder is None:
+            raise ValueError("AHA proprio initialization requires aha_aligned")
+        source_state = source_module.state_dict()
+        target_state = self.proprio_encoder.state_dict()
+        mismatched: dict[str, Any] = {}
+        for key, value in target_state.items():
+            source_value = source_state.get(key)
+            if not isinstance(source_value, torch.Tensor):
+                mismatched[key] = "missing"
+            elif tuple(source_value.shape) != tuple(value.shape):
+                mismatched[key] = (tuple(source_value.shape), tuple(value.shape))
+        if mismatched:
+            raise RuntimeError(
+                f"AHA proprio encoder is incompatible with the student: {mismatched}"
+            )
+        self.proprio_encoder.load_state_dict(source_state, strict=True)
+        metadata = getattr(self, "initialization_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["aha_proprio_encoder"] = {
+            "source": "frozen_teacher.proprio_encoder",
+            "loaded_keys": sorted(target_state),
+        }
+        self.initialization_metadata = metadata
+
+    def load_aha_action_expert_slice(
+        self,
+        teacher_expert: nn.Module,
+        *,
+        teacher_layer_mapping: Sequence[int],
+        teacher_branch_embedding: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Create a coherent compact ActionDiT by structured AHA slicing."""
+
+        if not isinstance(self.action_expert, AHAAlignedActionExpert):
+            raise ValueError("AHA structured slicing requires aha_aligned")
+        if len(teacher_layer_mapping) != self.config.num_layers:
+            raise ValueError("One teacher layer is required per student action layer")
+        teacher_blocks = getattr(teacher_expert, "blocks", None)
+        if not isinstance(teacher_blocks, nn.ModuleList):
+            raise TypeError("AHA teacher action expert has no block list")
+        if min(teacher_layer_mapping) <= 0 or max(teacher_layer_mapping) > len(
+            teacher_blocks
+        ):
+            raise ValueError("Teacher layer mapping exceeds the AHA action expert")
+
+        source_parameter = next(teacher_expert.parameters())
+        source_device = source_parameter.device
+        source_hidden = int(teacher_expert.action_encoder.out_features)
+        source_ffn = int(teacher_blocks[0].ffn[0].out_features)
+        source_attention = int(teacher_blocks[0].self_attn.q.out_features)
+        source_heads = int(getattr(teacher_expert, "num_heads"))
+        source_head_dim = int(getattr(teacher_expert, "attn_head_dim"))
+        if source_attention != source_heads * source_head_dim:
+            raise ValueError("AHA teacher attention dimensions are inconsistent")
+        if source_head_dim != self.config.head_dim:
+            raise ValueError("Teacher/student attention head dimensions must match")
+
+        hidden_indices = _selection_indices(
+            source_hidden, self.config.action_hidden_dim, device=source_device
+        )
+        ffn_indices = _selection_indices(
+            source_ffn, self.config.action_ffn_dim, device=source_device
+        )
+        head_indices = _selection_indices(
+            source_heads, self.config.num_heads, device=source_device
+        )
+        attention_indices = (
+            head_indices[:, None] * source_head_dim
+            + torch.arange(source_head_dim, device=source_device)[None, :]
+        ).reshape(-1)
+        time_output_indices = torch.cat(
+            [hidden_indices + group * source_hidden for group in range(6)]
+        )
+        copied: set[str] = set()
+
+        def copy_tensor(
+            name: str, target: torch.Tensor, source: torch.Tensor
+        ) -> None:
+            if tuple(target.shape) != tuple(source.shape):
+                raise RuntimeError(
+                    f"AHA slice shape mismatch for {name}: "
+                    f"{tuple(source.shape)} vs {tuple(target.shape)}"
+                )
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+            copied.add(name)
+
+        def copy_linear(
+            prefix: str,
+            target: nn.Linear,
+            source: nn.Linear,
+            *,
+            output_indices: torch.Tensor | None = None,
+            input_indices: torch.Tensor | None = None,
+        ) -> None:
+            weight = source.weight
+            if output_indices is not None:
+                weight = weight.index_select(0, output_indices)
+            if input_indices is not None:
+                weight = weight.index_select(1, input_indices)
+            copy_tensor(f"{prefix}.weight", target.weight, weight)
+            if target.bias is not None:
+                if source.bias is None:
+                    raise RuntimeError(f"AHA source has no bias for {prefix}")
+                bias = source.bias
+                if output_indices is not None:
+                    bias = bias.index_select(0, output_indices)
+                copy_tensor(f"{prefix}.bias", target.bias, bias)
+
+        with torch.no_grad():
+            target_expert = self.action_expert
+            copy_linear(
+                "action_encoder",
+                target_expert.action_encoder,
+                teacher_expert.action_encoder,
+                output_indices=hidden_indices,
+            )
+            copy_linear(
+                "text_embedding.0",
+                target_expert.text_embedding[0],
+                teacher_expert.text_embedding[0],
+                output_indices=hidden_indices,
+            )
+            copy_linear(
+                "text_embedding.2",
+                target_expert.text_embedding[2],
+                teacher_expert.text_embedding[2],
+                output_indices=hidden_indices,
+                input_indices=hidden_indices,
+            )
+            copy_linear(
+                "time_embedding.0",
+                target_expert.time_embedding[0],
+                teacher_expert.time_embedding[0],
+                output_indices=hidden_indices,
+            )
+            copy_linear(
+                "time_embedding.2",
+                target_expert.time_embedding[2],
+                teacher_expert.time_embedding[2],
+                output_indices=hidden_indices,
+                input_indices=hidden_indices,
+            )
+            copy_linear(
+                "time_projection.1",
+                target_expert.time_projection[1],
+                teacher_expert.time_projection[1],
+                output_indices=time_output_indices,
+                input_indices=hidden_indices,
+            )
+            copy_linear(
+                "head",
+                target_expert.head,
+                teacher_expert.head,
+                input_indices=hidden_indices,
+            )
+
+            for student_layer, teacher_layer in enumerate(teacher_layer_mapping):
+                target_block = target_expert.blocks[student_layer]
+                source_block = teacher_blocks[int(teacher_layer) - 1]
+                prefix = f"blocks.{student_layer}"
+                copy_tensor(
+                    f"{prefix}.modulation",
+                    target_block.modulation,
+                    source_block.modulation.index_select(-1, hidden_indices),
+                )
+                for attention_name in ("self_attn", "cross_attn"):
+                    target_attention = getattr(target_block, attention_name)
+                    source_attention_module = getattr(source_block, attention_name)
+                    for projection_name in ("q", "k", "v"):
+                        copy_linear(
+                            f"{prefix}.{attention_name}.{projection_name}",
+                            getattr(target_attention, projection_name),
+                            getattr(source_attention_module, projection_name),
+                            output_indices=attention_indices,
+                            input_indices=hidden_indices,
+                        )
+                    copy_linear(
+                        f"{prefix}.{attention_name}.o",
+                        target_attention.o,
+                        source_attention_module.o,
+                        output_indices=hidden_indices,
+                        input_indices=attention_indices,
+                    )
+                    for norm_name in ("norm_q", "norm_k"):
+                        copy_tensor(
+                            f"{prefix}.{attention_name}.{norm_name}.weight",
+                            getattr(target_attention, norm_name).weight,
+                            getattr(source_attention_module, norm_name)
+                            .weight.index_select(0, attention_indices),
+                        )
+                copy_tensor(
+                    f"{prefix}.norm3.weight",
+                    target_block.norm3.weight,
+                    source_block.norm3.weight.index_select(0, hidden_indices),
+                )
+                copy_tensor(
+                    f"{prefix}.norm3.bias",
+                    target_block.norm3.bias,
+                    source_block.norm3.bias.index_select(0, hidden_indices),
+                )
+                copy_linear(
+                    f"{prefix}.ffn.0",
+                    target_block.ffn[0],
+                    source_block.ffn[0],
+                    output_indices=ffn_indices,
+                    input_indices=hidden_indices,
+                )
+                copy_linear(
+                    f"{prefix}.ffn.2",
+                    target_block.ffn[2],
+                    source_block.ffn[2],
+                    output_indices=hidden_indices,
+                    input_indices=ffn_indices,
+                )
+
+            expected = set(target_expert.state_dict())
+            missing = sorted(expected - copied)
+            if missing:
+                raise RuntimeError(
+                    f"AHA structured slice did not initialize: {missing[:20]}"
+                )
+            if self.action_branch_embedding is None:
+                raise RuntimeError("AHA action branch embedding is missing")
+            sliced_branch = teacher_branch_embedding.index_select(
+                1, hidden_indices.to(device=teacher_branch_embedding.device)
+            )
+            copy_tensor(
+                "root.action_branch_embedding",
+                self.action_branch_embedding,
+                sliced_branch,
+            )
+
+        metadata = getattr(self, "initialization_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        slice_metadata = {
+            "source": "frozen_teacher.action_expert",
+            "selection": "evenly_spaced",
+            "teacher_layers": [int(layer) for layer in teacher_layer_mapping],
+            "source_hidden": source_hidden,
+            "target_hidden": self.config.action_hidden_dim,
+            "source_ffn": source_ffn,
+            "target_ffn": self.config.action_ffn_dim,
+            "source_heads": source_heads,
+            "target_heads": self.config.num_heads,
+            "head_dim": source_head_dim,
+            "copied_tensor_count": len(copied),
+        }
+        metadata["aha_action_structured_slice"] = slice_metadata
+        metadata["effective_action_initialization"] = "aha_structured_slice"
+        self.initialization_metadata = metadata
+        return slice_metadata
 
     def load_efficient_action_expert(
         self,
@@ -781,6 +1386,11 @@ class OVCRSActionGenerator(nn.Module):
         strict: bool = True,
     ) -> tuple[list[str], list[str]]:
         """Initialize matching action tensors from an Efficient-WAM checkpoint."""
+
+        if self.config.action_architecture != "efficient_joint":
+            raise ValueError(
+                "Efficient action-expert loading is only valid for efficient_joint"
+            )
 
         source: Mapping[str, Any] = checkpoint
         for container_key in ("model", "state_dict"):
@@ -815,3 +1425,142 @@ class OVCRSActionGenerator(nn.Module):
             )
         self.action_expert.load_state_dict(loaded, strict=False)
         return missing, mismatched
+
+    def load_stage1_initialization(
+        self,
+        checkpoint: Mapping[str, Any],
+        *,
+        source: str | None = None,
+        include_action: bool = True,
+    ) -> dict[str, Any]:
+        """Partially initialize a changed Stage 1 architecture with an audit trail."""
+
+        state: Mapping[str, Any] = checkpoint
+        candidate = checkpoint.get("student")
+        if isinstance(candidate, Mapping):
+            state = candidate
+        tensor_source = {
+            str(key): value for key, value in state.items() if isinstance(value, torch.Tensor)
+        }
+        prepared_source = dict(tensor_source)
+        transformed_origins: dict[str, str] = {}
+        target_state = self.state_dict()
+        if include_action and isinstance(self.action_expert, AHAAlignedActionExpert):
+            qkv_indices = {"q": 0, "k": 1, "v": 2}
+            for layer_index in range(self.config.num_layers):
+                old_prefix = f"action_expert.blocks.{layer_index}"
+                new_prefix = f"{old_prefix}.self_attn"
+                old_qkv_key = f"{old_prefix}.wan_action_qkv"
+                old_qkv = tensor_source.get(old_qkv_key)
+                if isinstance(old_qkv, torch.Tensor) and old_qkv.ndim == 4:
+                    for projection_name, projection_index in qkv_indices.items():
+                        target_key = f"{new_prefix}.{projection_name}.weight"
+                        prepared_source[target_key] = old_qkv[
+                            projection_index
+                        ].permute(0, 2, 1).reshape(
+                            self.config.video_dim, self.config.action_hidden_dim
+                        )
+                        transformed_origins[target_key] = (
+                            f"{old_qkv_key}[{projection_index}]"
+                        )
+                        bias_key = f"{new_prefix}.{projection_name}.bias"
+                        prepared_source[bias_key] = torch.zeros_like(
+                            target_state[bias_key]
+                        )
+                        transformed_origins[bias_key] = "zero_for_bias_compatibility"
+                old_output_key = f"{old_prefix}.wan_action_o.weight"
+                if old_output_key in tensor_source:
+                    target_key = f"{new_prefix}.o.weight"
+                    prepared_source[target_key] = tensor_source[old_output_key]
+                    transformed_origins[target_key] = old_output_key
+                    bias_key = f"{new_prefix}.o.bias"
+                    prepared_source[bias_key] = torch.zeros_like(target_state[bias_key])
+                    transformed_origins[bias_key] = "zero_for_bias_compatibility"
+                for norm_name in ("q", "k"):
+                    old_norm_key = f"{old_prefix}.wan_action_norm_{norm_name}.weight"
+                    if old_norm_key in tensor_source:
+                        target_key = f"{new_prefix}.norm_{norm_name}.weight"
+                        prepared_source[target_key] = tensor_source[old_norm_key]
+                        transformed_origins[target_key] = old_norm_key
+        aliases = {
+            "action_expert.action_encoder.weight": (
+                "action_expert.input_encoder.action_encoder.0.weight"
+            ),
+            "action_expert.action_encoder.bias": (
+                "action_expert.input_encoder.action_encoder.0.bias"
+            ),
+            "action_expert.head.weight": (
+                "action_expert.decoder.action_head.0.weight"
+            ),
+            "action_expert.head.bias": "action_expert.decoder.action_head.0.bias",
+        }
+        loaded: dict[str, torch.Tensor] = {}
+        mapped: dict[str, str] = {}
+        mismatched: dict[str, dict[str, list[int]]] = {}
+        for target_key, target_value in target_state.items():
+            if not include_action and (
+                target_key.startswith("action_expert.")
+                or target_key.startswith("proprio_encoder.")
+                or target_key == "action_branch_embedding"
+            ):
+                continue
+            source_key = (
+                target_key if target_key in prepared_source else aliases.get(target_key)
+            )
+            if source_key is None or source_key not in prepared_source:
+                continue
+            source_value = prepared_source[source_key]
+            if tuple(source_value.shape) != tuple(target_value.shape):
+                mismatched[target_key] = {
+                    "source": list(source_value.shape),
+                    "target": list(target_value.shape),
+                }
+                continue
+            loaded[target_key] = source_value
+            source_origin = transformed_origins.get(target_key, source_key)
+            if source_origin != target_key:
+                mapped[target_key] = source_origin
+        self.load_state_dict(loaded, strict=False)
+
+        zero_initialized: list[str] = []
+        if include_action and isinstance(self.action_expert, AHAAlignedActionExpert):
+            for layer_index, block in enumerate(self.action_expert.blocks):
+                output_prefix = f"action_expert.blocks.{layer_index}.cross_attn.o"
+                if f"{output_prefix}.weight" in loaded:
+                    continue
+                nn.init.zeros_(block.cross_attn.o.weight)
+                if block.cross_attn.o.bias is not None:
+                    nn.init.zeros_(block.cross_attn.o.bias)
+                zero_initialized.append(output_prefix)
+
+        saved_config = checkpoint.get("student_config")
+        source_architecture = None
+        if isinstance(saved_config, Mapping):
+            source_architecture = saved_config.get(
+                "action_architecture", "efficient_joint"
+            )
+        considered_target_keys = set(target_state)
+        if not include_action:
+            considered_target_keys = {
+                key
+                for key in considered_target_keys
+                if not key.startswith("action_expert.")
+                and not key.startswith("proprio_encoder.")
+                and key != "action_branch_embedding"
+            }
+        metadata: dict[str, Any] = {
+            "source": source,
+            "source_format": checkpoint.get("format"),
+            "source_step": checkpoint.get("step"),
+            "source_action_architecture": source_architecture,
+            "target_action_architecture": self.config.action_architecture,
+            "scope": "all_compatible" if include_action else "conditioning_only",
+            "loaded_tensor_count": len(loaded),
+            "loaded_keys": sorted(loaded),
+            "mapped_keys": dict(sorted(mapped.items())),
+            "missing_target_keys": sorted(considered_target_keys - set(loaded)),
+            "shape_mismatches": dict(sorted(mismatched.items())),
+            "zero_initialized_cross_attention_outputs": zero_initialized,
+        }
+        self.initialization_metadata = metadata
+        return metadata

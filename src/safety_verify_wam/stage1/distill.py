@@ -376,6 +376,8 @@ class AHAOVCRSStage1Program(nn.Module):
             observation_tokens=targets.observation_tokens,
             observation_mask=targets.observation_mask,
             video_kv_cache=targets.video_kv_cache,
+            action_context=targets.action_context,
+            action_context_mask=targets.action_context_mask,
             return_trace=needs_editor_trace,
         )
         loss, tensor_terms = stage1_distillation_loss(
@@ -430,6 +432,9 @@ class AHAOVCRSStage1Program(nn.Module):
             ),
             "step": step,
         }
+        initialization = getattr(self.student, "initialization_metadata", None)
+        if isinstance(initialization, Mapping):
+            payload["initialization"] = dict(initialization)
         if self.efficient_training_adapter is not None:
             training_metadata = {
                 "action_noise_sampling": getattr(
@@ -507,6 +512,8 @@ def create_aha_ovcr_s_stage1(
     mot_checkpoint_mixed_attn: bool | None = None,
     num_history_frames: int | None = None,
     efficient_action_checkpoint: str | Path | None = None,
+    student_initialization_checkpoint: str | Path | None = None,
+    aha_action_initialization: str = "none",
     strict_action_init: bool = True,
     aha_current_conditioning: Mapping[str, Any] | None = None,
     efficient_conditioning: Mapping[str, Any] | None = None,
@@ -526,8 +533,26 @@ def create_aha_ovcr_s_stage1(
         resolved_loss_config = loss_config
     else:
         resolved_loss_config = Stage1LossConfig(**dict(loss_config))
+    resolved_aha_action_initialization = str(aha_action_initialization).strip().lower()
+    if resolved_aha_action_initialization not in {"none", "structured_slice"}:
+        raise ValueError(
+            "aha_action_initialization must be 'none' or 'structured_slice'"
+        )
+    if (
+        resolved_aha_action_initialization == "structured_slice"
+        and resolved_student_config.action_architecture != "aha_aligned"
+    ):
+        raise ValueError("AHA structured slicing requires action_architecture=aha_aligned")
 
     student = OVCRSActionGenerator(resolved_student_config)
+    if (
+        efficient_action_checkpoint not in (None, "", "null")
+        and student_initialization_checkpoint not in (None, "", "null")
+    ):
+        raise ValueError(
+            "efficient_action_checkpoint and student_initialization_checkpoint "
+            "are mutually exclusive"
+        )
     if efficient_action_checkpoint not in (None, "", "null"):
         checkpoint_path = Path(efficient_action_checkpoint).expanduser()
         try:
@@ -543,6 +568,26 @@ def create_aha_ovcr_s_stage1(
         student.load_efficient_action_expert(
             checkpoint, strict=bool(strict_action_init)
         )
+    if student_initialization_checkpoint not in (None, "", "null"):
+        initialization_path = Path(student_initialization_checkpoint).expanduser()
+        try:
+            initialization_checkpoint = torch.load(
+                initialization_path, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            initialization_checkpoint = torch.load(
+                initialization_path, map_location="cpu"
+            )
+        if not isinstance(initialization_checkpoint, Mapping):
+            raise TypeError(
+                "Stage 1 initialization checkpoint must contain a mapping: "
+                f"{initialization_path}"
+            )
+        student.load_stage1_initialization(
+            initialization_checkpoint,
+            source=str(initialization_path.resolve()),
+            include_action=(resolved_aha_action_initialization == "none"),
+        )
     resolved_parameter_dtype = _resolve_parameter_dtype(
         student_parameter_dtype,
         fallback=model_dtype,
@@ -551,6 +596,13 @@ def create_aha_ovcr_s_stage1(
     if aha_current_conditioning is not None and efficient_conditioning is not None:
         raise ValueError(
             "aha_current_conditioning and efficient_conditioning are mutually exclusive"
+        )
+    if (
+        resolved_student_config.action_architecture == "aha_aligned"
+        and efficient_conditioning is not None
+    ):
+        raise ValueError(
+            "aha_aligned requires AHA video/text conditioning, not Efficient conditioning"
         )
     efficient_training_adapter: nn.Module | None = None
     using_aha_current_conditioning = aha_current_conditioning is not None
@@ -623,7 +675,38 @@ def create_aha_ovcr_s_stage1(
             efficient_training_adapter is not None
             and resolved_loss_config.response_weight > 0
         ),
+        current_conditioning_only=(
+            using_aha_current_conditioning
+            and resolved_loss_config.teacher_action_weight == 0
+            and resolved_loss_config.query_weight == 0
+            and resolved_loss_config.route_weight == 0
+            and resolved_loss_config.delta_weight == 0
+            and resolved_loss_config.response_weight == 0
+        ),
     )
+    if resolved_student_config.action_architecture == "aha_aligned":
+        teacher_proprio_encoder = getattr(
+            adapter.raw_model, "proprio_encoder", None
+        )
+        if not isinstance(teacher_proprio_encoder, nn.Module):
+            raise RuntimeError("AHA teacher has no proprio encoder to initialize")
+        student.load_aha_proprio_encoder(teacher_proprio_encoder)
+        if resolved_aha_action_initialization == "structured_slice":
+            teacher_action_expert = getattr(
+                adapter.raw_model, "action_expert", None
+            )
+            teacher_branch_embedding = getattr(
+                adapter.raw_model.mot, "action_branch_embedding", None
+            )
+            if not isinstance(teacher_action_expert, nn.Module) or not isinstance(
+                teacher_branch_embedding, torch.Tensor
+            ):
+                raise RuntimeError("AHA teacher action modules are unavailable for slicing")
+            student.load_aha_action_expert_slice(
+                teacher_action_expert,
+                teacher_layer_mapping=teacher_layer_mapping,
+                teacher_branch_embedding=teacher_branch_embedding,
+            )
     teacher_model = adapter.raw_model
     compatibility_values = {
         "action_horizon": action_horizon,
@@ -729,6 +812,10 @@ def create_ground_truth_ovcr_s_stage1(
         )
 
     student = OVCRSActionGenerator(resolved_student_config)
+    if resolved_student_config.action_architecture == "aha_aligned":
+        raise ValueError(
+            "Ground-truth-only Stage 1 cannot provide AHA task-text conditioning"
+        )
     if efficient_action_checkpoint not in (None, "", "null"):
         checkpoint_path = Path(efficient_action_checkpoint).expanduser()
         try:

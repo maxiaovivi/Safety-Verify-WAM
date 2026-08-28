@@ -12,7 +12,9 @@ student:
   action_hidden_dim: 768
   action_ffn_dim: 3072
   action_chunk_size: 16
-  num_registers: 4
+  num_registers: 0
+  action_architecture: aha_aligned
+  text_context_dim: 4096
   time_embedding_dim: 256
   num_train_timesteps: 1000
   distill_layers: [3, 6, 9, 12]
@@ -27,9 +29,9 @@ teacher_distillation:
 
 loss:
   velocity_weight: 1.0
-  teacher_action_weight: 1.0
-  ground_truth_action_weight: 0.25
-  preservation_weight: 0.25
+  teacher_action_weight: 0.0
+  ground_truth_action_weight: 0.0
+  preservation_weight: 0.0
   query_weight: 0.0
   route_weight: 0.0
   delta_weight: 0.0
