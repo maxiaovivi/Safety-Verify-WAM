@@ -100,6 +100,11 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
     source_root = args.source_root.expanduser().resolve()
+    fallback_root = (
+        args.fallback_root.expanduser().resolve()
+        if args.fallback_root is not None
+        else None
+    )
     source_manifest = source_root / "manifests" / "samples.jsonl"
     source_manifest_bytes = source_manifest.read_bytes()
     source_manifest_sha256 = hashlib.sha256(source_manifest_bytes).hexdigest()
@@ -116,7 +121,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if row.get("dataset_partition") not in {"train", "calibration", "challenge"}:
             continue
-        source_paths = {name: source_root / str(exports.get(name, "")) for name in REQUIRED_EXPORTS}
+        source_paths = {}
+        for name in REQUIRED_EXPORTS:
+            relative = Path(str(exports.get(name, "")))
+            primary = source_root / relative
+            fallback = fallback_root / relative if fallback_root is not None else None
+            source_paths[name] = (
+                primary
+                if primary.is_file()
+                else fallback
+                if fallback is not None and fallback.is_file()
+                else primary
+            )
         if not all(path.is_file() for path in source_paths.values()):
             continue
         sidecar = json.loads(source_paths["label_path"].read_text(encoding="utf-8"))
@@ -219,6 +235,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "schema_version": 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_root": str(source_root),
+            "fallback_root": str(fallback_root) if fallback_root is not None else None,
             "source_manifest": str(source_manifest),
             "source_manifest_snapshot": "SOURCE_MANIFEST.jsonl",
             "source_manifest_sha256": source_manifest_sha256,
@@ -254,6 +271,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--fallback-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tail-rows", type=int, default=256)
     parser.add_argument("--train-episodes", type=int, default=12)

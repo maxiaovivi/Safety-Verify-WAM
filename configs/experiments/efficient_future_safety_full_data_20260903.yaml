@@ -7,6 +7,8 @@ scope: scaled_fixed_window_experiment
 source:
   official_efficient_wam_commit: 2bd75a8c56acfcd5754b98c7ed313176911ccae0
   negative_dataset_root: /mnt/hdd/ziyu/maxiao/Efficient-WAM-RoboTwin-Negative-Samples
+  archived_batch: batch-0002-accepted-000446-001245
+  archive_restore_root: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/data/archive-restore-batch0002-20260903/restored
   slice_root: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/data/efficient-future-safety-full-c007-c008-20260903
   portable_checkpoint: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/checkpoints/portable-safety-joint-real-context4-v5-20260830/formal/best.pt
 
