@@ -265,6 +265,7 @@ def main() -> None:
     )
     scheduler.set_timesteps(num_inference_steps=args.num_video_steps, training=False)
     portable = load_multidomain_checkpoint(args.portable_checkpoint, map_location=args.device)
+    portable.model.to(args.device)
     portable.model.eval()
     profile = portable.profiles["bimanual_qpos14"]
 
