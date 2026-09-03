@@ -35,6 +35,32 @@ def _stable_key(seed: int, sample_id: str) -> str:
     return hashlib.sha256(f"{seed}:{sample_id}".encode()).hexdigest()
 
 
+def _relative_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    relative = Path(value)
+    if relative.is_absolute() or relative == Path("."):
+        return None
+    return relative
+
+
+def _complete_exports(
+    source_root: Path, fallback_root: Path | None, sample_id: str
+) -> tuple[dict[str, Any], str | None]:
+    relative = Path("data") / "samples" / sample_id / "complete.json"
+    candidates = [source_root / relative]
+    if fallback_root is not None:
+        candidates.append(fallback_root / relative)
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        complete = json.loads(candidate.read_text(encoding="utf-8"))
+        exports = complete.get("efficient_wam")
+        if isinstance(exports, dict):
+            return exports, str(candidate)
+    return {}, None
+
+
 def _accepted(row: dict[str, Any]) -> bool:
     assessment = row.get("quality_assessment")
     if isinstance(assessment, dict) and assessment.get("accepted") is False:
@@ -121,18 +147,47 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if row.get("dataset_partition") not in {"train", "calibration", "challenge"}:
             continue
+        sample_id = str(row["sample_id"])
+        complete_exports: dict[str, Any] | None = None
+        complete_marker: str | None = None
         source_paths = {}
+        path_resolution = {}
         for name in REQUIRED_EXPORTS:
-            relative = Path(str(exports.get(name, "")))
+            relative = _relative_path(exports.get(name))
+            metadata_source = "samples_manifest"
+            if relative is None:
+                if complete_exports is None:
+                    complete_exports, complete_marker = _complete_exports(
+                        source_root, fallback_root, sample_id
+                    )
+                relative = _relative_path(complete_exports.get(name))
+                metadata_source = "complete_marker"
+            if relative is None:
+                source_paths[name] = source_root / "__missing_export__" / name / sample_id
+                path_resolution[name] = {
+                    "metadata_source": "missing",
+                    "relative_path": None,
+                    "file_source": "missing",
+                }
+                continue
             primary = source_root / relative
             fallback = fallback_root / relative if fallback_root is not None else None
-            source_paths[name] = (
-                primary
-                if primary.is_file()
-                else fallback
-                if fallback is not None and fallback.is_file()
-                else primary
-            )
+            if primary.is_file():
+                source_paths[name] = primary
+                file_source = "source_root"
+            elif fallback is not None and fallback.is_file():
+                source_paths[name] = fallback
+                file_source = "fallback_root"
+            else:
+                source_paths[name] = primary
+                file_source = "missing"
+            path_resolution[name] = {
+                "metadata_source": metadata_source,
+                "relative_path": str(relative),
+                "file_source": file_source,
+            }
+            if metadata_source == "complete_marker":
+                path_resolution[name]["complete_marker"] = complete_marker
         if not all(path.is_file() for path in source_paths.values()):
             continue
         sidecar = json.loads(source_paths["label_path"].read_text(encoding="utf-8"))
@@ -151,6 +206,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             continue
         enriched = dict(row)
         enriched["_source_paths"] = {key: str(value) for key, value in source_paths.items()}
+        enriched["_path_resolution"] = path_resolution
         enriched["_paired"] = paired
         enriched["_frame_labels"] = labels
         eligible.append(enriched)
@@ -189,6 +245,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     hashes[field] = _sha256(destination)
                 row.pop("_paired")
                 frame_labels = row.pop("_frame_labels")
+                path_resolution = row.pop("_path_resolution")
                 source_record = dict(row)
                 episode_record = {
                     "sample_id": sample_id,
@@ -201,6 +258,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     "scene_group_id": row["scene_group_id"],
                     "paths": copied,
                     "sha256": hashes,
+                    "path_resolution": path_resolution,
                     "source_record": source_record,
                 }
                 episode_rows.append(episode_record)
