@@ -32,6 +32,13 @@ from .guard import (
     DeterministicActionGuard,
     GuardResult,
 )
+from .future import (
+    FUTURE_MODES,
+    EfficientFutureSafetyConfig,
+    EfficientFutureSafetySidecar,
+    extract_future_value_tokens,
+    future_trainable_parameter_count,
+)
 from .losses import portable_safety_loss
 from .model import (
     PortableSafetyConfig,
@@ -96,4 +103,9 @@ __all__ = [
     "save_portable_checkpoint",
     "load_portable_checkpoint",
     "sha256_file",
+    "FUTURE_MODES",
+    "EfficientFutureSafetyConfig",
+    "EfficientFutureSafetySidecar",
+    "extract_future_value_tokens",
+    "future_trainable_parameter_count",
 ]
