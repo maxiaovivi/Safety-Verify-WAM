@@ -29,7 +29,11 @@ def _batch(batch_size: int = 2) -> SafetyBatch:
     )
 
 
-def _model(*, query_residual: bool = True) -> EfficientFutureSafetySidecar:
+def _model(
+    *,
+    query_residual: bool = True,
+    query_source: str = "current",
+) -> EfficientFutureSafetySidecar:
     base = MultiProfilePortableSafetyCore(
         MultiProfileSafetyConfig(
             profiles=(
@@ -54,6 +58,7 @@ def _model(*, query_residual: bool = True) -> EfficientFutureSafetySidecar:
             future_dim=64,
             attention_heads=4,
             query_residual=query_residual,
+            query_source=query_source,
         ),
     ).eval()
 
@@ -97,6 +102,17 @@ def test_future_required_path_has_no_direct_query_passthrough() -> None:
     )
     assert torch.equal(with_future["class_logits"], expected)
     assert not torch.equal(without_future["class_logits"], with_future["class_logits"])
+
+
+def test_learned_queries_remove_sample_specific_current_features() -> None:
+    torch.manual_seed(6)
+    model = _model(query_residual=False, query_source="learned")
+    batch = _batch()
+    future = torch.randn(2, 20, 64)
+    output = model("bimanual_qpos14", batch, future, future_mode="full")
+    assert model.learned_queries is not None
+    assert model.learned_queries.shape == (1, 65, 32)
+    assert output["class_logits"].shape == (2, 2)
 
 
 def test_future_adapter_trains_without_touching_base() -> None:

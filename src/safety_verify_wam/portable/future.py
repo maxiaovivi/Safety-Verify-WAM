@@ -11,6 +11,7 @@ from .multidomain import MultiProfilePortableSafetyCore
 
 
 FUTURE_MODES = ("none", "mean", "full", "shuffled")
+FUTURE_QUERY_SOURCES = ("current", "learned")
 
 
 def _scalar_int(value: Any, *, name: str) -> int:
@@ -75,6 +76,8 @@ class EfficientFutureSafetyConfig:
     dropout: float = 0.0
     detach_future: bool = True
     query_residual: bool = True
+    query_source: str = "current"
+    max_action_steps: int = 64
 
     def __post_init__(self) -> None:
         if self.future_dim < 1:
@@ -85,6 +88,12 @@ class EfficientFutureSafetyConfig:
             raise ValueError("dropout must be in [0,1)")
         if not isinstance(self.query_residual, bool):
             raise TypeError("query_residual must be bool")
+        if self.query_source not in FUTURE_QUERY_SOURCES:
+            raise ValueError(
+                f"query_source must be one of {FUTURE_QUERY_SOURCES}"
+            )
+        if self.max_action_steps < 1:
+            raise ValueError("max_action_steps must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +133,13 @@ class EfficientFutureSafetySidecar(nn.Module):
         )
         nn.init.zeros_(self.future_attention.out_proj.weight)
         nn.init.zeros_(self.future_attention.out_proj.bias)
+        if self.config.query_source == "learned":
+            self.learned_queries = nn.Parameter(
+                torch.empty(1, self.config.max_action_steps + 1, dim)
+            )
+            nn.init.normal_(self.learned_queries, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("learned_queries", None)
         self.freeze_base = bool(freeze_base)
         if self.freeze_base:
             for parameter in self.base.parameters():
@@ -227,13 +243,23 @@ class EfficientFutureSafetySidecar(nn.Module):
             device=parameter.device, dtype=parameter.dtype
         )
         mask = mask.to(device=parameter.device)
-        queries = torch.cat(
+        current_queries = torch.cat(
             [
                 base_outputs["risk_features"].unsqueeze(1),
                 base_outputs["step_risk_features"],
             ],
             dim=1,
         ).to(dtype=parameter.dtype)
+        if self.config.query_source == "learned":
+            if current_queries.shape[1] > self.config.max_action_steps + 1:
+                raise ValueError(
+                    "Action horizon exceeds max_action_steps for learned queries"
+                )
+            queries = self.learned_queries[
+                :, : current_queries.shape[1]
+            ].expand(batch.batch_size, -1, -1)
+        else:
+            queries = current_queries
         projected = self.future_projection(self.future_norm(future_tokens))
         correction, _ = self.future_attention(
             self.query_norm(queries),
