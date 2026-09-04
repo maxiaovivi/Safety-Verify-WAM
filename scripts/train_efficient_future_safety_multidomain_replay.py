@@ -276,6 +276,42 @@ def _is_better(candidate: dict[str, float], incumbent: dict[str, float] | None) 
     ) > (incumbent["worst_domain_ap"], incumbent["mean_domain_ap"])
 
 
+def _domain_batch_counts(
+    config: dict[str, Any], domain_names: list[str]
+) -> dict[str, int]:
+    batch_size = int(config["batch_size"])
+    configured = config.get("domain_batch_counts")
+    if configured is None:
+        if batch_size % len(domain_names):
+            raise ValueError("Batch size must divide evenly over domains")
+        counts = {name: batch_size // len(domain_names) for name in domain_names}
+    else:
+        if set(configured) != set(domain_names):
+            raise ValueError("domain_batch_counts must name every domain exactly once")
+        counts = {name: int(configured[name]) for name in domain_names}
+        if sum(counts.values()) != batch_size:
+            raise ValueError("domain_batch_counts must sum to batch_size")
+    if any(count < 2 or count % 2 for count in counts.values()):
+        raise ValueError("Every domain batch count must be a positive even number")
+    return counts
+
+
+def _domain_loss_weights(
+    config: dict[str, Any], domain_names: list[str]
+) -> dict[str, float]:
+    configured = config.get("domain_loss_weights")
+    if configured is None:
+        raw = {name: 1.0 for name in domain_names}
+    else:
+        if set(configured) != set(domain_names):
+            raise ValueError("domain_loss_weights must name every domain exactly once")
+        raw = {name: float(configured[name]) for name in domain_names}
+    if any(value <= 0.0 for value in raw.values()):
+        raise ValueError("Every domain loss weight must be positive")
+    total = sum(raw.values())
+    return {name: value / total for name, value in raw.items()}
+
+
 def _final_split(
     model: EfficientFutureSafetySidecar,
     records: list[dict[str, Any]],
@@ -370,10 +406,9 @@ def main() -> None:
         name: TaskBalancedSampler(values["train"], seed + offset)
         for offset, (name, values) in enumerate(sorted(domains.items()))
     }
-    batch_size = int(config["batch_size"])
-    if batch_size % len(domains):
-        raise ValueError("Batch size must divide evenly over domains")
-    per_domain = batch_size // len(domains)
+    domain_names = sorted(domains)
+    domain_batch_counts = _domain_batch_counts(config, domain_names)
+    domain_loss_weights = _domain_loss_weights(config, domain_names)
     eval_batch_size = int(config["eval_batch_size"])
     eval_every = int(config["eval_every"])
     checkpoint_every = int(config["checkpoint_every"])
@@ -422,8 +457,8 @@ def main() -> None:
     for step in range(1, steps + 1):
         chosen: list[dict[str, Any]] = []
         domain_index: list[int] = []
-        for index, name in enumerate(sorted(domains)):
-            selected = samplers[name].sample(per_domain)
+        for index, name in enumerate(domain_names):
+            selected = samplers[name].sample(domain_batch_counts[name])
             chosen.extend(selected)
             domain_index.extend([index] * len(selected))
         order = list(range(len(chosen)))
@@ -449,7 +484,10 @@ def main() -> None:
         domain_losses = [
             each[domain_tensor == index].mean() for index in range(len(domains))
         ]
-        loss = torch.stack(domain_losses).mean()
+        loss = sum(
+            domain_loss_weights[name] * domain_losses[index]
+            for index, name in enumerate(domain_names)
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -565,6 +603,8 @@ def main() -> None:
         },
         "seed": seed,
         "steps": steps,
+        "domain_batch_counts": domain_batch_counts,
+        "domain_loss_weights": domain_loss_weights,
         "trainable_parameters": int(sum(value.numel() for value in trainable)),
         "best_step": best_step,
         "best_selection": best_selection,

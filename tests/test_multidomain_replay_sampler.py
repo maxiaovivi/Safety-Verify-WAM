@@ -37,3 +37,31 @@ def test_selection_prioritizes_worst_domain() -> None:
     stronger_worst = {"worst_domain_ap": 0.7, "mean_domain_ap": 0.75}
     assert MODULE._is_better(stronger_worst, stronger_average)
     assert not MODULE._is_better(stronger_average, stronger_worst)
+
+
+def test_domain_batch_counts_accept_explicit_ratio() -> None:
+    counts = MODULE._domain_batch_counts(
+        {
+            "batch_size": 8,
+            "domain_batch_counts": {"maniskill": 2, "robotwin": 6},
+        },
+        ["maniskill", "robotwin"],
+    )
+    assert counts == {"maniskill": 2, "robotwin": 6}
+
+
+def test_domain_batch_counts_preserve_equal_default() -> None:
+    counts = MODULE._domain_batch_counts(
+        {"batch_size": 8}, ["maniskill", "robotwin"]
+    )
+    assert counts == {"maniskill": 4, "robotwin": 4}
+
+
+def test_domain_loss_weights_are_normalized() -> None:
+    weights = MODULE._domain_loss_weights(
+        {
+            "domain_loss_weights": {"maniskill": 1.0, "robotwin": 3.0},
+        },
+        ["maniskill", "robotwin"],
+    )
+    assert weights == {"maniskill": 0.25, "robotwin": 0.75}
