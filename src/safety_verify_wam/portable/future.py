@@ -74,6 +74,7 @@ class EfficientFutureSafetyConfig:
     attention_heads: int = 4
     dropout: float = 0.0
     detach_future: bool = True
+    query_residual: bool = True
 
     def __post_init__(self) -> None:
         if self.future_dim < 1:
@@ -82,6 +83,8 @@ class EfficientFutureSafetyConfig:
             raise ValueError("attention_heads must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0,1)")
+        if not isinstance(self.query_residual, bool):
+            raise TypeError("query_residual must be bool")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -239,7 +242,9 @@ class EfficientFutureSafetySidecar(nn.Module):
             key_padding_mask=~mask,
             need_weights=False,
         )
-        corrected = queries + correction
+        corrected = (
+            queries + correction if self.config.query_residual else correction
+        )
         chunk_features = corrected[:, 0]
         step_features = corrected[:, 1:]
         chunk_head = (

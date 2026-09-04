@@ -29,7 +29,7 @@ def _batch(batch_size: int = 2) -> SafetyBatch:
     )
 
 
-def _model() -> EfficientFutureSafetySidecar:
+def _model(*, query_residual: bool = True) -> EfficientFutureSafetySidecar:
     base = MultiProfilePortableSafetyCore(
         MultiProfileSafetyConfig(
             profiles=(
@@ -50,7 +50,11 @@ def _model() -> EfficientFutureSafetySidecar:
     )
     return EfficientFutureSafetySidecar(
         base,
-        EfficientFutureSafetyConfig(future_dim=64, attention_heads=4),
+        EfficientFutureSafetyConfig(
+            future_dim=64,
+            attention_heads=4,
+            query_residual=query_residual,
+        ),
     ).eval()
 
 
@@ -79,6 +83,20 @@ def test_zero_initialized_future_path_preserves_checkpoint_logits() -> None:
     assert torch.equal(
         without_future["step_class_logits"], with_future["step_class_logits"]
     )
+
+
+def test_future_required_path_has_no_direct_query_passthrough() -> None:
+    torch.manual_seed(4)
+    model = _model(query_residual=False)
+    batch = _batch()
+    future = torch.randn(2, 20, 64)
+    without_future = model("bimanual_qpos14", batch, future_mode="none")
+    with_future = model("bimanual_qpos14", batch, future, future_mode="full")
+    expected = model.base.profile_chunk_heads["bimanual_qpos14"](
+        torch.zeros(2, model.base.config.model_dim)
+    )
+    assert torch.equal(with_future["class_logits"], expected)
+    assert not torch.equal(without_future["class_logits"], with_future["class_logits"])
 
 
 def test_future_adapter_trains_without_touching_base() -> None:
