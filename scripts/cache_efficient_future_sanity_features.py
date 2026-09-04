@@ -105,6 +105,28 @@ def _read_rgb_frame(path: Path, index: int) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
+def _read_rgb_image(path: Path) -> np.ndarray:
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError(f"Could not decode image {path}")
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def _numpy_tensor(path: Path, *, expected_shape: tuple[int, ...]) -> torch.Tensor:
+    value = torch.from_numpy(np.load(path)).to(dtype=torch.float32)
+    if tuple(value.shape) != expected_shape:
+        raise ValueError(f"{path} must be {expected_shape}, got {tuple(value.shape)}")
+    if not torch.isfinite(value).all():
+        raise ValueError(f"{path} contains non-finite values")
+    return value
+
+
+def _load_language(path: Path) -> torch.Tensor:
+    if path.suffix == ".npy":
+        return _language_tensor(torch.from_numpy(np.load(path)))
+    return _language_tensor(_torch_load(path))
+
+
 def _portable_views(frame: np.ndarray, size: int = 128) -> torch.Tensor:
     height, width = frame.shape[:2]
     head_height = (height * 2) // 3
@@ -287,28 +309,43 @@ def main() -> None:
         window_id = str(window["window_id"])
         if window_id in completed and (output / completed[window_id]["record_path"]).is_file():
             continue
-        paths = {key: slice_root / value for key, value in window["paths"].items()}
-        trajectory = _torch_load(paths["trajectory_path"])
-        all_states = _required_tensor(trajectory, "robot_state_qpos")
-        all_actions = _required_tensor(trajectory, "action_target_qpos")
-        condition = int(window["condition_frame_idx"])
-        action_indices = torch.tensor(window["action_indices"], dtype=torch.long)
-        state_physical = all_states[condition]
-        action_physical = all_actions.index_select(0, action_indices)
+        path_root = Path(window.get("path_root", slice_root))
+        paths = {key: path_root / value for key, value in window["paths"].items()}
+        if window.get("input_schema") == "maniskill_aloha_pair_v1":
+            state_physical = _numpy_tensor(paths["state_path"], expected_shape=(14,))
+            action_physical = _numpy_tensor(
+                paths["action_path"], expected_shape=(16, 14)
+            )
+            frame = _read_rgb_image(paths["image_path"])
+            dt = float(window["action_dt"])
+        else:
+            trajectory = _torch_load(paths["trajectory_path"])
+            all_states = _required_tensor(trajectory, "robot_state_qpos")
+            all_actions = _required_tensor(trajectory, "action_target_qpos")
+            condition = int(window["condition_frame_idx"])
+            action_indices = torch.tensor(window["action_indices"], dtype=torch.long)
+            state_physical = all_states[condition]
+            action_physical = all_actions.index_select(0, action_indices)
+            frame = _read_rgb_frame(paths["video_path"], condition)
+            dt = 3.0 / float(
+                json.loads(paths["label_path"].read_text())["temporal_safety"][
+                    "capture"
+                ]["physical_fps"]
+            )
         state_efficient = (state_physical - efficient_mean) / efficient_std
         action_efficient = (action_physical - efficient_mean) / efficient_std
 
-        frame = _read_rgb_frame(paths["video_path"], condition)
         efficient_frame = image_module.resize_with_padding(frame, (384, 320))
         efficient_frame = torch.from_numpy(efficient_frame.astype(np.float32) / 255.0)
         efficient_frame = efficient_frame.mul(2.0).sub(1.0)
         efficient_frame = efficient_frame.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
         views = _portable_views(frame)
-        text = _language_tensor(_torch_load(paths["language_path"]))
+        text = _load_language(paths["language_path"])
+        noise_key = str(window.get("scene_group_id", window["sample_id"]))
         generator = torch.Generator(device=args.device).manual_seed(
             args.seed
             + int(
-                hashlib.sha256(str(window["sample_id"]).encode()).hexdigest()[:8],
+                hashlib.sha256(noise_key.encode()).hexdigest()[:8],
                 16,
             )
         )
@@ -325,7 +362,6 @@ def main() -> None:
 
         state_portable = profile.normalize_state(state_physical).view(1, 1, -1).to(args.device)
         action_portable = profile.normalize_action(action_physical).unsqueeze(0).to(args.device)
-        dt = 3.0 / float(json.loads(paths["label_path"].read_text())["temporal_safety"]["capture"]["physical_fps"])
         safety_batch = SafetyBatch(
             video=views.unsqueeze(0).unsqueeze(0).to(args.device).float().div(255.0),
             state=state_portable,
@@ -367,10 +403,13 @@ def main() -> None:
         _append_jsonl(progress_path, row)
         print(json.dumps({"completed": index + 1, **row}), flush=True)
 
+    slice_manifest = json.loads((slice_root / "MANIFEST.json").read_text())
     summary = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "slice_manifest_sha256": _sha256(slice_root / "MANIFEST.json"),
+        "slice_input_schema": slice_manifest.get("input_schema", "robotwin_window_v1"),
+        "slice_source_root": slice_manifest.get("source_root"),
         "efficient_source_commit": "2bd75a8c56acfcd5754b98c7ed313176911ccae0",
         "deploy_config": str(args.deploy_config.resolve()),
         "deploy_config_sha256": _sha256(args.deploy_config),

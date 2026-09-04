@@ -1,0 +1,62 @@
+experiment_id: efficient-future-safety-maniskill-1800-20260904
+question: >-
+  Do detached, spatially preserved Efficient-WAM future-video tokens improve
+  an independent safety head on held-out ManiSkill Aloha multitask paired scenes?
+scope: maniskill_aloha_fixed_candidate_windows
+
+source:
+  official_efficient_wam_commit: 2bd75a8c56acfcd5754b98c7ed313176911ccae0
+  dataset_root: /mnt/hdd/ziyu/maxiao/ManiSkill-Safety-Data/datasets/maniskill_aloha_multitask_full_1800_v1
+  source_audit_required: PASS
+  portable_checkpoint: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/checkpoints/portable-safety-joint-real-context4-v5-20260830/formal/best.pt
+
+data:
+  matched_scene_groups: 900
+  train_records: 1250
+  validation_records: 250
+  held_out_test_records: 300
+  task_count: 5
+  hazard_family_count: 5
+  current_state_dim: 14
+  action_shape: [16, 14]
+  control_hz: 10
+
+efficient_features:
+  source: final_layer_future_video_value_tokens
+  preserve_spatial_tokens: true
+  detach: true
+  candidate_conditioning: clean_candidate_action_at_action_t_zero
+  paired_scene_noise: shared
+  num_video_steps: 2
+  num_video_frames: 8
+  model_checkpoint: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/checkpoints/Efficient-WAM_RoboTwin/Efficient-WAM/Efficient-WAM_stage3.pt
+  deploy_config: /mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/configs/efficient_robotwin_task_eval_resolved.yml
+
+safety_adapter:
+  future_dim: 2048
+  model_dim: 128
+  attention_heads: 4
+  dropout: 0.0
+  zero_initialized_output: true
+  freeze_efficient_wam: true
+  freeze_portable_safety_core: true
+  required_inputs: [current_rgb, current_robot_state, candidate_action_chunk]
+
+training:
+  modes: [full, mean]
+  diagnostic_modes: [none, shuffled]
+  seeds: [7, 17, 27]
+  steps: 2000
+  batch_size: 8
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  chunk_loss_weight: 1.0
+  step_loss_weight: 0.35
+  selection_split: validation
+  primary_report_split: test
+
+signal_check:
+  primary_metric: held_out_test_average_precision
+  requires_full_above_no_future: true
+  requires_full_above_shuffled_future: true
+  report_full_vs_spatial_mean: true

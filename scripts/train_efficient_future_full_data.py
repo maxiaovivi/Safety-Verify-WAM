@@ -201,6 +201,7 @@ def _train_one(
     base: torch.nn.Module,
     train_records: list[dict[str, Any]],
     eval_records: list[dict[str, Any]],
+    test_records: list[dict[str, Any]],
     device: torch.device,
     mode: str,
     seed: int,
@@ -281,6 +282,21 @@ def _train_one(
             eval_target, shuffled_score, threshold=threshold
         ),
     }
+    test_values: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    if test_records:
+        test_target, test_score = _predict(model, test_records, device, mode=mode)
+        _, test_shuffled_score = _predict(
+            model,
+            test_records,
+            device,
+            mode="shuffled",
+            shuffle_seed=seed + 2000,
+        )
+        result["test"] = _metrics(test_target, test_score, threshold=threshold)
+        result["test_shuffled_future"] = _metrics(
+            test_target, test_shuffled_score, threshold=threshold
+        )
+        test_values = test_target, test_score, test_shuffled_score
     run_dir = output / f"{mode}-seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     adapter_state = {
@@ -313,6 +329,23 @@ def _train_one(
     (run_dir / "predictions.jsonl").write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in predictions)
     )
+    if test_values is not None:
+        test_target, test_score, test_shuffled_score = test_values
+        test_predictions = [
+            {
+                "window_id": row["window"]["window_id"],
+                "target": int(target),
+                "score": float(score),
+                "shuffled_score": float(shuffled),
+                "task": row["window"]["task"],
+            }
+            for row, target, score, shuffled in zip(
+                test_records, test_target, test_score, test_shuffled_score
+            )
+        ]
+        (run_dir / "test_predictions.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in test_predictions)
+        )
     train_predictions = [
         {
             "window_id": row["window"]["window_id"],
@@ -343,6 +376,15 @@ def main() -> None:
     parser.add_argument("--seeds", default="7,17,27")
     parser.add_argument("--expected-train-records", type=int, required=True)
     parser.add_argument("--expected-eval-records", type=int, required=True)
+    parser.add_argument("--expected-test-records", type=int, default=0)
+    parser.add_argument(
+        "--question",
+        default=(
+            "Do spatially preserved Efficient-WAM future tokens improve an "
+            "independent safety head?"
+        ),
+    )
+    parser.add_argument("--scope", default="fixed-window experiment")
     args = parser.parse_args()
 
     cache_root = args.feature_cache.expanduser().resolve()
@@ -352,14 +394,17 @@ def main() -> None:
     records = [_torch_load(cache_root / row["record_path"]) for row in index_rows]
     train_records = [row for row in records if row["window"]["split"] == "train"]
     eval_records = [row for row in records if row["window"]["split"] == "eval"]
+    test_records = [row for row in records if row["window"]["split"] == "test"]
     if (
         len(train_records) != args.expected_train_records
         or len(eval_records) != args.expected_eval_records
+        or len(test_records) != args.expected_test_records
     ):
         raise RuntimeError(
             f"Expected {args.expected_train_records} train/"
-            f"{args.expected_eval_records} eval records, got "
-            f"{len(train_records)}/{len(eval_records)}"
+            f"{args.expected_eval_records} eval/"
+            f"{args.expected_test_records} test records, got "
+            f"{len(train_records)}/{len(eval_records)}/{len(test_records)}"
         )
     device = torch.device(args.device)
     loaded = load_multidomain_checkpoint(args.portable_checkpoint, map_location="cpu")
@@ -380,6 +425,12 @@ def main() -> None:
         raise RuntimeError(f"Future branch changed initial logits by {zero_init_max_delta}")
     fixed_threshold = float(loaded.profile_thresholds["bimanual_qpos14"].chunk_risk)
     reference = _metrics(probe_target, probe_score, threshold=fixed_threshold)
+    test_reference = None
+    if test_records:
+        test_target, test_score = _predict(probe, test_records, device, mode="none")
+        test_reference = _metrics(
+            test_target, test_score, threshold=fixed_threshold
+        )
     del probe
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -392,6 +443,7 @@ def main() -> None:
                 base=base,
                 train_records=train_records,
                 eval_records=eval_records,
+                test_records=test_records,
                 device=device,
                 mode=mode,
                 seed=seed,
@@ -425,32 +477,50 @@ def main() -> None:
     full_ap = aggregate("full", "eval")
     full_shuffled_ap = aggregate("full", "eval_shuffled_future")
     mean_ap = aggregate("mean", "eval")
+    primary_field = "test" if test_records else "eval"
+    primary_shuffled_field = (
+        "test_shuffled_future" if test_records else "eval_shuffled_future"
+    )
+    primary_full_ap = aggregate("full", primary_field)
+    primary_full_shuffled_ap = aggregate("full", primary_shuffled_field)
+    primary_mean_ap = aggregate("mean", primary_field)
+    primary_reference = test_reference or reference
     summary = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "question": "Do spatially preserved Efficient-WAM future tokens improve an independent safety head on time-matched RoboTwin risk windows?",
-        "scope": "scaled fixed-window experiment; not a deployment or benchmark-wide claim",
+        "question": args.question,
+        "scope": args.scope,
         "feature_cache": str(cache_root),
         "feature_cache_summary_sha256": _sha256(cache_root / "SUMMARY.json"),
         "portable_checkpoint": str(args.portable_checkpoint.resolve()),
         "portable_checkpoint_sha256": _sha256(args.portable_checkpoint),
         "train_records": len(train_records),
         "eval_records": len(eval_records),
+        "test_records": len(test_records),
         "class_counts": dict(
             Counter(record["window"]["risk"] for record in records)
         ),
         "zero_init_max_logit_delta": zero_init_max_delta,
         "no_future_reference": reference,
+        "no_future_test_reference": test_reference,
         "full_eval_ap": full_ap,
         "full_shuffled_eval_ap": full_shuffled_ap,
         "mean_eval_ap": mean_ap,
+        "primary_split": primary_field,
+        "full_primary_ap": primary_full_ap,
+        "full_shuffled_primary_ap": primary_full_shuffled_ap,
+        "mean_primary_ap": primary_mean_ap,
         "signal_check": {
-            "full_minus_no_future_ap": full_ap["mean"] - reference["average_precision"],
-            "full_minus_shuffled_ap": full_ap["mean"] - full_shuffled_ap["mean"],
-            "full_minus_mean_ap": full_ap["mean"] - mean_ap["mean"],
+            "split": primary_field,
+            "full_minus_no_future_ap": primary_full_ap["mean"]
+            - primary_reference["average_precision"],
+            "full_minus_shuffled_ap": primary_full_ap["mean"]
+            - primary_full_shuffled_ap["mean"],
+            "full_minus_mean_ap": primary_full_ap["mean"]
+            - primary_mean_ap["mean"],
             "passes_exploratory_check": bool(
-                full_ap["mean"] > reference["average_precision"]
-                and full_ap["mean"] > full_shuffled_ap["mean"]
+                primary_full_ap["mean"] > primary_reference["average_precision"]
+                and primary_full_ap["mean"] > primary_full_shuffled_ap["mean"]
             ),
         },
         "git": {
