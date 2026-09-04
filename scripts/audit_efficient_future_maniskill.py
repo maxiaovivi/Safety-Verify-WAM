@@ -332,6 +332,12 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     reporting = "PASS" if not mismatches else "FAIL"
     result = {
         "schema_version": 1,
+        "training_git": summary["git"],
+        "audit_git": {
+            "branch": _git(["branch", "--show-current"], worktree),
+            "commit": _git(["rev-parse", "HEAD"], worktree),
+            "script_sha256": _sha256(worktree / "scripts" / "audit_efficient_future_maniskill.py"),
+        },
         "verdict": "WARN" if reporting == "PASS" else "FAIL",
         "reporting_fidelity": reporting,
         "scientific_support": "WARN",
