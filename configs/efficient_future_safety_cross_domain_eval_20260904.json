@@ -1,0 +1,24 @@
+{
+  "run_id": "efficient-future-safety-cross-domain-eval-20260904",
+  "device": "cuda:0",
+  "cuda_memory_fraction": 0.08,
+  "batch_size": 32,
+  "seeds": [7, 17, 27],
+  "portable_checkpoint": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/checkpoints/portable-safety-joint-real-context4-v5-20260830/formal/best.pt",
+  "source_artifact": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-maniskill-1800-20260904",
+  "maniskill_controls_artifact": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-maniskill-controls-20260904",
+  "robotwin_feature_cache": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-full-data-20260903/feature-cache",
+  "portable_training_config": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/portable-sidecar-joint-real-context4-v5-20260830/formal/config.resolved.json",
+  "portable_reference_predictions": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/portable-sidecar-joint-real-context4-v5-20260830/formal/val_predictions.jsonl",
+  "output": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-cross-domain-eval-20260904",
+  "expected": {
+    "maniskill_test_records": 300,
+    "robotwin_eval_records": 280,
+    "ur5_val_records": 62
+  },
+  "libero": {
+    "manifest_root": null,
+    "required_profile": null,
+    "note": "No Safety-Verify-WAM-owned LIBERO safety manifest or Efficient future cache is currently available."
+  }
+}
