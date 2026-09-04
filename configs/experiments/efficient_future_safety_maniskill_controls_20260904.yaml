@@ -1,0 +1,50 @@
+experiment_id: efficient-future-safety-maniskill-controls-20260904
+question: >-
+  Does the safety head require each sample's Efficient-WAM future tokens, or
+  can an equal-capacity adapter solve the held-out classification task from its
+  current-observation, robot-state, and candidate-action query alone?
+scope: maniskill_aloha_fixed_candidate_windows
+
+source_experiment:
+  branch: experiment/efficient-future-safety-maniskill-1800-20260904
+  commit: e2ebcd8d68ea7bb05c37fdbc233253f17c44357f
+  records: 1800
+  matched_scene_groups: 900
+  train_records: 1250
+  validation_records: 250
+  held_out_test_records: 300
+
+controls:
+  trainable_constant_future:
+    architecture: identical_to_full_future_adapter
+    training_steps: 2000
+    definition: elementwise_train_split_mean_preserving_all_token_positions
+    removes: sample_specific_future_information
+  paired_future_swap:
+    keeps: [current_rgb, current_robot_state, candidate_action]
+    replaces: future_tokens_with_opposite_label_same_scene
+  paired_action_swap:
+    keeps: [current_rgb, current_robot_state, future_tokens]
+    replaces: candidate_action_with_opposite_label_same_scene
+  zero_future:
+    definition: all_zero_token_bank_with_original_shape
+
+training:
+  seeds: [7, 17, 27]
+  steps: 2000
+  batch_size: 8
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  chunk_loss_weight: 1.0
+  step_loss_weight: 0.35
+  threshold_selection_split: train
+  report_split: held_out_test
+
+evidence_check:
+  metric: held_out_test_average_precision
+  minimum_full_minus_paired_future_swap: 0.05
+  minimum_full_minus_trainable_constant_future: 0.05
+  interpretation: >-
+    Both differences must pass for evidence that predictions depend on the
+    sample-specific future. Detection accuracy is reported separately as exact
+    correct decisions divided by 300 per seed.
