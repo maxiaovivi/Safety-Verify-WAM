@@ -182,7 +182,7 @@ def _maniskill_results(config: dict[str, Any], output: Path) -> dict[str, Any]:
         rows = [
             {
                 "sample_id": str(row["window_id"]),
-                "scene_group_id": str(row["scene_group_id"]),
+                "scene_group_id": str(row.get("scene_group_id", row["window_id"])),
                 "task": str(row["task"]),
                 "target": int(row["target"]),
                 "score": float(row["score"]),
