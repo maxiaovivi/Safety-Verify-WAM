@@ -36,6 +36,7 @@ from scripts.train_efficient_future_full_data import (  # noqa: E402
 from safety_verify_wam.portable import (  # noqa: E402
     EfficientFutureSafetyConfig,
     EfficientFutureSafetySidecar,
+    MultiProfilePortableSafetyCore,
     load_multidomain_checkpoint,
 )
 
@@ -78,13 +79,15 @@ def _atomic_adapter(
     seed: int,
     step: int,
     selection: dict[str, float],
+    include_base: bool = False,
+    initialization: str = "pretrained",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     state = {
         name: value.detach().cpu()
         for name, value in model.state_dict().items()
-        if not name.startswith("base.")
+        if include_base or not name.startswith("base.")
     }
     torch.save(
         {
@@ -94,6 +97,8 @@ def _atomic_adapter(
             "seed": seed,
             "step": step,
             "selection": selection,
+            "initialization": initialization,
+            "state_scope": "full_safety_head" if include_base else "future_adapter",
             "future_config": model.config.to_dict(),
             "adapter_state": state,
         },
@@ -113,6 +118,20 @@ def _git(command: list[str]) -> str | None:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _initialize_base(
+    pretrained: MultiProfilePortableSafetyCore,
+    initialization: str,
+) -> MultiProfilePortableSafetyCore:
+    if initialization == "pretrained":
+        return copy.deepcopy(pretrained)
+    if initialization == "random":
+        return MultiProfilePortableSafetyCore(copy.deepcopy(pretrained.config))
+    raise ValueError(
+        "base_initialization must be either 'pretrained' or 'random', "
+        f"got {initialization!r}"
+    )
 
 
 class TaskBalancedSampler:
@@ -353,12 +372,14 @@ def main() -> None:
     }
     portable_checkpoint = Path(config["portable_checkpoint"]).resolve()
     loaded = load_multidomain_checkpoint(portable_checkpoint, map_location="cpu")
-    base = loaded.model.eval()
-    for parameter in base.parameters():
-        parameter.requires_grad_(False)
+    base_initialization = str(config.get("base_initialization", "pretrained"))
+    freeze_base = bool(config.get("freeze_base", True))
+    if base_initialization == "random" and freeze_base:
+        raise ValueError("Random base initialization requires freeze_base=false")
+    base = _initialize_base(loaded.model, base_initialization)
     future_config = EfficientFutureSafetyConfig(**config["future_adapter"])
     model = EfficientFutureSafetySidecar(
-        copy.deepcopy(base), future_config, freeze_base=True
+        base, future_config, freeze_base=freeze_base
     ).to(device)
     trainable = [value for value in model.parameters() if value.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -381,10 +402,13 @@ def main() -> None:
     trace: list[dict[str, Any]] = []
     best_selection: dict[str, float] | None = None
     best_step = 0
+    stale_evaluations = 0
+    early_stopping_patience = int(config.get("early_stopping_patience_evals", 0))
+    early_stopping_min_steps = int(config.get("early_stopping_min_steps", 0))
     started = time.monotonic()
 
-    def evaluate(step: int) -> None:
-        nonlocal best_selection, best_step
+    def evaluate(step: int) -> bool:
+        nonlocal best_selection, best_step, stale_evaluations
         evaluation = _evaluate_ap(
             model,
             domains,
@@ -401,24 +425,33 @@ def main() -> None:
             "selection": selection,
         }
         trace.append(event)
-        if _is_better(selection, best_selection):
+        improved = _is_better(selection, best_selection)
+        if improved:
             best_selection = selection
             best_step = step
+            stale_evaluations = 0
             _atomic_adapter(
                 output / "best.pt",
                 model,
                 seed=seed,
                 step=step,
                 selection=selection,
+                include_base=not freeze_base,
+                initialization=base_initialization,
             )
+        elif step >= early_stopping_min_steps:
+            stale_evaluations += 1
         _atomic_json(
             output / "progress.json",
             {"best_step": best_step, "best_selection": best_selection, "trace": trace},
         )
         print(json.dumps({"phase": "validation", **event}), flush=True)
+        return improved
 
     evaluate(0)
     model.train()
+    stopped_reason = "steps_completed"
+    completed_steps = 0
     for step in range(1, steps + 1):
         chosen: list[dict[str, Any]] = []
         domain_index: list[int] = []
@@ -454,6 +487,7 @@ def main() -> None:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
+        completed_steps = step
         if step == 1 or step % 25 == 0:
             print(
                 json.dumps(
@@ -476,10 +510,30 @@ def main() -> None:
                 seed=seed,
                 step=step,
                 selection=best_selection,
+                include_base=not freeze_base,
+                initialization=base_initialization,
             )
         if step % eval_every == 0 or step == steps:
             evaluate(step)
             model.train()
+            if (
+                early_stopping_patience > 0
+                and step >= early_stopping_min_steps
+                and stale_evaluations >= early_stopping_patience
+            ):
+                stopped_reason = "cross_domain_early_stopping"
+                print(
+                    json.dumps(
+                        {
+                            "phase": "early_stopping",
+                            "step": step,
+                            "best_step": best_step,
+                            "stale_evaluations": stale_evaluations,
+                        }
+                    ),
+                    flush=True,
+                )
+                break
 
     best_payload = _torch_load(output / "best.pt")
     incompatible = model.load_state_dict(best_payload["adapter_state"], strict=False)
@@ -564,7 +618,12 @@ def main() -> None:
             for name, value in config["domains"].items()
         },
         "seed": seed,
-        "steps": steps,
+        "steps": completed_steps,
+        "requested_steps": steps,
+        "completed_steps": completed_steps,
+        "stopped_reason": stopped_reason,
+        "base_initialization": base_initialization,
+        "freeze_base": freeze_base,
         "trainable_parameters": int(sum(value.numel() for value in trainable)),
         "best_step": best_step,
         "best_selection": best_selection,

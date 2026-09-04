@@ -1,0 +1,46 @@
+{
+  "run_id": "efficient-future-safety-random-init-balanced-20260904",
+  "device": "cuda:0",
+  "cuda_memory_fraction": 0.08,
+  "seed": 7,
+  "steps": 1000,
+  "batch_size": 8,
+  "eval_batch_size": 64,
+  "eval_every": 100,
+  "checkpoint_every": 200,
+  "early_stopping_patience_evals": 4,
+  "early_stopping_min_steps": 400,
+  "learning_rate": 0.00005,
+  "weight_decay": 0.001,
+  "chunk_loss_weight": 1.0,
+  "step_loss_weight": 0.35,
+  "base_initialization": "random",
+  "freeze_base": false,
+  "future_adapter": {
+    "future_dim": 2048,
+    "attention_heads": 4,
+    "dropout": 0.0,
+    "detach_future": true
+  },
+  "portable_checkpoint": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/checkpoints/portable-safety-joint-real-context4-v5-20260830/formal/best.pt",
+  "domains": {
+    "maniskill": {
+      "feature_cache": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-maniskill-1800-20260904/feature-cache",
+      "expected": {"train": 1250, "eval": 250, "test": 300}
+    },
+    "robotwin": {
+      "feature_cache": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-full-data-20260903/feature-cache",
+      "expected": {"train": 992, "eval": 280, "test": 0}
+    }
+  },
+  "selection": {
+    "primary": "maximum_worst_domain_validation_ap",
+    "tie_break": "maximum_mean_domain_validation_ap"
+  },
+  "acceptance": {
+    "minimum_maniskill_test_ap": 0.80,
+    "minimum_robotwin_eval_ap": 0.76,
+    "minimum_each_domain_full_minus_shuffled_ap": 0.03
+  },
+  "output": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-random-init-balanced-20260904"
+}
