@@ -181,7 +181,11 @@ def audit(artifact: Path, config: Path, worktree: Path) -> dict[str, Any]:
             )
     raw_audit["maniskill"] = {
         "unique_windows": len(
-            {row["sample_id"] for rows in maniskill_seed_rows.values() for row in rows}
+            {
+                row.get("sample_id", row["window_id"])
+                for rows in maniskill_seed_rows.values()
+                for row in rows
+            }
         ),
         "seed_count": len(maniskill_seed_rows),
     }
