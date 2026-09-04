@@ -147,6 +147,55 @@ class TaskBalancedSampler:
         return chosen
 
 
+def _pair_map(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Map every window to the opposite-label future from the same scene."""
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        groups[str(record["window"]["scene_group_id"])].append(record)
+    result: dict[str, dict[str, Any]] = {}
+    for group, rows in groups.items():
+        by_label: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            by_label[int(row["window"]["chunk_target"])].append(row)
+        if set(by_label) != {0, 1}:
+            raise RuntimeError(
+                f"Scene group {group!r} needs both safe and risk records"
+            )
+        for label, label_rows in by_label.items():
+            opposite = by_label[1 - label]
+            for index, row in enumerate(label_rows):
+                result[str(row["window"]["window_id"])] = opposite[
+                    index % len(opposite)
+                ]
+    return result
+
+
+def _paired_records(
+    records: list[dict[str, Any]],
+    pair_by_window: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        pair_by_window[str(record["window"]["window_id"])]
+        for record in records
+    ]
+
+
+def _paired_future_margin_loss(
+    true_logits: torch.Tensor,
+    paired_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+) -> torch.Tensor:
+    """Require the true future to move risk logits in the label direction."""
+
+    true_risk = true_logits[:, 1] - true_logits[:, 0]
+    paired_risk = paired_logits[:, 1] - paired_logits[:, 0]
+    direction = target.to(dtype=true_risk.dtype).mul(2).sub(1)
+    return F.relu(float(margin) - direction * (true_risk - paired_risk))
+
+
 def _load_domain(config: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     root = Path(config["feature_cache"]).expanduser().resolve()
     index = _read_jsonl(root / "features.jsonl")
@@ -370,6 +419,9 @@ def main() -> None:
         name: TaskBalancedSampler(values["train"], seed + offset)
         for offset, (name, values) in enumerate(sorted(domains.items()))
     }
+    pair_maps = {
+        name: _pair_map(values["train"]) for name, values in domains.items()
+    }
     batch_size = int(config["batch_size"])
     if batch_size % len(domains):
         raise ValueError("Batch size must divide evenly over domains")
@@ -378,6 +430,8 @@ def main() -> None:
     eval_every = int(config["eval_every"])
     checkpoint_every = int(config["checkpoint_every"])
     steps = int(config["steps"])
+    paired_rank_weight = float(config.get("paired_future_rank_weight", 0.0))
+    paired_rank_margin = float(config.get("paired_future_rank_margin", 0.0))
     trace: list[dict[str, Any]] = []
     best_selection: dict[str, float] | None = None
     best_step = 0
@@ -421,19 +475,26 @@ def main() -> None:
     model.train()
     for step in range(1, steps + 1):
         chosen: list[dict[str, Any]] = []
+        paired_chosen: list[dict[str, Any]] = []
         domain_index: list[int] = []
         for index, name in enumerate(sorted(domains)):
             selected = samplers[name].sample(per_domain)
             chosen.extend(selected)
+            paired_chosen.extend(_paired_records(selected, pair_maps[name]))
             domain_index.extend([index] * len(selected))
         order = list(range(len(chosen)))
         random.shuffle(order)
         chosen = [chosen[index] for index in order]
+        paired_chosen = [paired_chosen[index] for index in order]
         domain_tensor = torch.as_tensor(
             [domain_index[index] for index in order], dtype=torch.long, device=device
         )
         safety, future, chunk_target, step_target = _batch(chosen, device)
+        _, paired_future, _, _ = _batch(paired_chosen, device)
         tensors = model("bimanual_qpos14", safety, future, future_mode="full")
+        paired_tensors = model(
+            "bimanual_qpos14", safety, paired_future, future_mode="full"
+        )
         chunk_each = F.cross_entropy(
             tensors["class_logits"], chunk_target, reduction="none"
         )
@@ -446,6 +507,13 @@ def main() -> None:
             float(config["chunk_loss_weight"]) * chunk_each
             + float(config["step_loss_weight"]) * step_each
         )
+        paired_rank_each = _paired_future_margin_loss(
+            tensors["class_logits"],
+            paired_tensors["class_logits"],
+            chunk_target,
+            margin=paired_rank_margin,
+        )
+        each = each + paired_rank_weight * paired_rank_each
         domain_losses = [
             each[domain_tensor == index].mean() for index in range(len(domains))
         ]
@@ -464,6 +532,9 @@ def main() -> None:
                         "domain_losses": [
                             float(value.detach()) for value in domain_losses
                         ],
+                        "paired_future_rank_loss": float(
+                            paired_rank_each.mean().detach()
+                        ),
                     }
                 ),
                 flush=True,
@@ -540,8 +611,11 @@ def main() -> None:
         "run_id": config["run_id"],
         "created_at": _now(),
         "question": (
-            "Does balanced ManiSkill/RoboTwin replay prevent the single-domain "
-            "future safety adapter from forgetting RoboTwin?"
+            config.get(
+                "question",
+                "Does balanced ManiSkill/RoboTwin replay prevent the single-domain "
+                "future safety adapter from forgetting RoboTwin?",
+            )
         ),
         "scope": "offline fixed candidate-action classification",
         "git": {
