@@ -1,5 +1,5 @@
 {
-  "run_id": "efficient-future-safety-multidomain-replay-pilot-20260904",
+  "run_id": "efficient-future-safety-multidomain-replay-lr5e5-20260904",
   "device": "cuda:0",
   "cuda_memory_fraction": 0.08,
   "seed": 7,
@@ -8,7 +8,7 @@
   "eval_batch_size": 64,
   "eval_every": 100,
   "checkpoint_every": 200,
-  "learning_rate": 0.0003,
+  "learning_rate": 0.00005,
   "weight_decay": 0.001,
   "chunk_loss_weight": 1.0,
   "step_loss_weight": 0.35,
@@ -38,5 +38,5 @@
     "minimum_robotwin_eval_ap": 0.78,
     "minimum_each_domain_full_minus_shuffled_ap": 0.03
   },
-  "output": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-multidomain-replay-pilot-20260904"
+  "output": "/mnt/hdd/ziyu/maxiao/Safety-Verify-WAM-Stage1/artifacts/efficient-future-safety-multidomain-replay-lr5e5-20260904"
 }
