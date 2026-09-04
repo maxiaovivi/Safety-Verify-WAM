@@ -1,6 +1,6 @@
 {
   "run_id": "efficient-future-safety-multidomain-paired-rank-20260904",
-  "question": "Does a same-scene opposite-outcome future ranking loss reduce action-shortcut overfitting across ManiSkill and RoboTwin?",
+  "question": "Does an opposite-outcome future ranking loss, exact-scene for ManiSkill and task-stratified for RoboTwin, reduce action-shortcut overfitting across both domains?",
   "device": "cuda:0",
   "cuda_memory_fraction": 0.08,
   "seed": 7,

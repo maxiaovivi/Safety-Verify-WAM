@@ -12,7 +12,7 @@ import random
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -147,28 +147,66 @@ class TaskBalancedSampler:
         return chosen
 
 
-def _pair_map(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Map every window to the opposite-label future from the same scene."""
+def _stable_choice(
+    record: dict[str, Any], candidates: list[dict[str, Any]]
+) -> dict[str, Any]:
+    ordered = sorted(candidates, key=lambda row: str(row["window"]["window_id"]))
+    digest = hashlib.sha256(
+        str(record["window"]["window_id"]).encode("utf-8")
+    ).digest()
+    return ordered[int.from_bytes(digest[:8], "big") % len(ordered)]
 
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+def _pair_map(
+    records: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Pair an opposite label exactly by scene or by the narrowest task stratum."""
+
+    exact: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    stratified: list[dict[tuple[Any, ...], list[dict[str, Any]]]] = [
+        defaultdict(list),
+        defaultdict(list),
+        defaultdict(list),
+    ]
+    fields = (
+        ("task", "setting", "condition_frame_idx"),
+        ("task", "condition_frame_idx"),
+        ("task",),
+    )
     for record in records:
-        groups[str(record["window"]["scene_group_id"])].append(record)
+        window = record["window"]
+        label = int(window["chunk_target"])
+        if window.get("scene_group_id") is not None:
+            exact[(str(window["scene_group_id"]), label)].append(record)
+        for index, names in enumerate(fields):
+            key = tuple(window.get(name) for name in names) + (label,)
+            stratified[index][key].append(record)
+
     result: dict[str, dict[str, Any]] = {}
-    for group, rows in groups.items():
-        by_label: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            by_label[int(row["window"]["chunk_target"])].append(row)
-        if set(by_label) != {0, 1}:
+    methods: Counter[str] = Counter()
+    for record in records:
+        window = record["window"]
+        label = int(window["chunk_target"])
+        candidates: list[dict[str, Any]] = []
+        method = ""
+        if window.get("scene_group_id") is not None:
+            candidates = exact.get((str(window["scene_group_id"]), 1 - label), [])
+            if candidates:
+                method = "exact_scene"
+        if not candidates:
+            for index, names in enumerate(fields):
+                key = tuple(window.get(name) for name in names) + (1 - label,)
+                candidates = stratified[index].get(key, [])
+                if candidates:
+                    method = "matched_" + "_".join(names)
+                    break
+        if not candidates:
             raise RuntimeError(
-                f"Scene group {group!r} needs both safe and risk records"
+                f"No opposite-label future match for {window['window_id']!r}"
             )
-        for label, label_rows in by_label.items():
-            opposite = by_label[1 - label]
-            for index, row in enumerate(label_rows):
-                result[str(row["window"]["window_id"])] = opposite[
-                    index % len(opposite)
-                ]
-    return result
+        result[str(window["window_id"])] = _stable_choice(record, candidates)
+        methods[method] += 1
+    return result, dict(sorted(methods.items()))
 
 
 def _paired_records(
@@ -419,9 +457,10 @@ def main() -> None:
         name: TaskBalancedSampler(values["train"], seed + offset)
         for offset, (name, values) in enumerate(sorted(domains.items()))
     }
-    pair_maps = {
-        name: _pair_map(values["train"]) for name, values in domains.items()
-    }
+    pair_maps: dict[str, dict[str, dict[str, Any]]] = {}
+    pairing_diagnostics: dict[str, dict[str, int]] = {}
+    for name, values in domains.items():
+        pair_maps[name], pairing_diagnostics[name] = _pair_map(values["train"])
     batch_size = int(config["batch_size"])
     if batch_size % len(domains):
         raise ValueError("Batch size must divide evenly over domains")
@@ -637,6 +676,7 @@ def main() -> None:
             }
             for name, value in config["domains"].items()
         },
+        "paired_future_matching": pairing_diagnostics,
         "seed": seed,
         "steps": steps,
         "trainable_parameters": int(sum(value.numel() for value in trainable)),

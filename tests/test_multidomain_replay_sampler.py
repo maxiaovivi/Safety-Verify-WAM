@@ -53,9 +53,29 @@ def test_pair_map_uses_opposite_label_in_same_scene() -> None:
         }
         for label in (0, 1)
     ]
-    pairs = MODULE._pair_map(records)
+    pairs, methods = MODULE._pair_map(records)
     assert pairs["scene-1-0"]["window"]["chunk_target"] == 1
     assert pairs["scene-1-1"]["window"]["chunk_target"] == 0
+    assert methods == {"exact_scene": 2}
+
+
+def test_pair_map_falls_back_to_narrow_task_stratum() -> None:
+    records = [
+        {
+            "window": {
+                "chunk_target": label,
+                "task": "a",
+                "setting": "randomized",
+                "condition_frame_idx": 7,
+                "window_id": f"independent-{label}",
+            }
+        }
+        for label in (0, 1)
+    ]
+    pairs, methods = MODULE._pair_map(records)
+    assert pairs["independent-0"]["window"]["chunk_target"] == 1
+    assert pairs["independent-1"]["window"]["chunk_target"] == 0
+    assert methods == {"matched_task_setting_condition_frame_idx": 2}
 
 
 def test_paired_future_margin_loss_rewards_label_direction() -> None:
