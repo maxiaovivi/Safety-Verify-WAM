@@ -386,6 +386,9 @@ def _predict_ur5(
     dataset: Any,
     profile: Any,
     device: torch.device,
+    *,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> list[dict[str, Any]]:
     model.eval()
     metadata = {str(row["sample_id"]): row for row in dataset.rows}
@@ -393,7 +396,10 @@ def _predict_ur5(
     for raw_batch in loader:
         safety = to_safety_batch(raw_batch, device)
         safety.validate(profile)
-        output = model("ur5_speedl7", safety, future_mode="none")
+        with torch.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
+        ):
+            output = model("ur5_speedl7", safety, future_mode="none")
         score = output["risk_probability"].float().cpu()
         for index, sample_id in enumerate(raw_batch["sample_id"]):
             source = metadata[str(sample_id)]
@@ -423,13 +429,15 @@ def _ur5_results(
     )
     dataset_config = dict(training_config["datasets"]["ur5"])
     dataset_config["num_workers"] = 0
-    dataset_config["batch_size"] = int(config["batch_size"])
     dataset = dataset_from_config(dataset_config, "val")
     expected = int(config["expected"]["ur5_val_records"])
     if len(dataset) != expected:
         raise RuntimeError(f"Expected {expected} UR5 records, found {len(dataset)}")
     profile = loaded.profiles["ur5_speedl7"]
     threshold = float(loaded.profile_thresholds["ur5_speedl7"].chunk_risk)
+    amp_name = str(training_config["training"].get("amp", "float32")).lower()
+    amp_enabled = device.type == "cuda" and amp_name not in {"none", "float32"}
+    amp_dtype = torch.bfloat16 if amp_name == "bfloat16" else torch.float16
     source = Path(config["source_artifact"]).resolve()
     seeds = [int(value) for value in config["seeds"]]
     runs: dict[str, Any] = {}
@@ -443,7 +451,15 @@ def _ur5_results(
             checkpoint=source / f"full-seed{seed}" / "adapter.pt",
             device=device,
         )
-        rows = _predict_ur5(model, loader, dataset, profile, device)
+        rows = _predict_ur5(
+            model,
+            loader,
+            dataset,
+            profile,
+            device,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
         for row in rows:
             row["threshold"] = threshold
             row["prediction"] = int(row["score"] >= threshold)
@@ -490,6 +506,7 @@ def _ur5_results(
         "evaluation_kind": "offline_fixed_candidate_window_classification",
         "split": "validation_two_episodes_single_scene_group",
         "future_source": None,
+        "inference_precision": amp_name,
         "future_limitation": (
             "The current Efficient-WAM future cache is bimanual qpos14; it is "
             "not compatible with the UR5 speedl7 profile. This run verifies the "
